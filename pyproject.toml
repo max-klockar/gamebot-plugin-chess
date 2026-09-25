@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chess-plugin"
+version = "0.1.0"
+description = "Chess game plugin for gamebot"
+requires-python = ">=3.11"
+dependencies = [
+  "gamebot",
+  "numpy>=1.26",
+  "opencv-python-headless>=4.9",
+  "python-chess>=1.999",
+]
+
+[project.entry-points."gamebot.plugins"]
+chess = "chess_plugin:get_plugin"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+chess_plugin = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
