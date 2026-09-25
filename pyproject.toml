@@ -7,6 +7,8 @@ name = "chess-plugin"
 version = "0.1.0"
 description = "Chess game plugin for gamebot"
 requires-python = ">=3.11"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE.md", "NOTICE"]
 dependencies = [
   "gamebot",
   "numpy>=1.26",
