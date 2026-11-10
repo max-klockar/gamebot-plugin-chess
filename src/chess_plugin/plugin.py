@@ -106,7 +106,10 @@ class ChessGameSession:
         if found is None:
             print("side detect inconclusive — assuming human=white")
             return True
-        print(f"side detect: human_is_white={found} (lighter pieces on near side={found})")
+        print(
+            f"side detect: human_is_white={found} "
+            f"(near=bot side; lighter-on-near → bot white → human_is_white={found})"
+        )
         return found
 
     def on_enter(self) -> None:

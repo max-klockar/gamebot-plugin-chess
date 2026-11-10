@@ -69,11 +69,12 @@ def detect_human_is_white(
     frame_bgr: np.ndarray,
     board_corners_px: np.ndarray,
 ) -> bool | None:
-    """Infer whether the human (near / bottom side of the calibrated board) plays white.
+    """Infer whether the human plays white from the starting armies.
 
-    Warps the board (TL→top-left … BL→bottom-left). Compares piece brightness on the
-    near ranks (rows 6–7 ≈ ranks 1–2) vs far ranks (rows 0–1 ≈ ranks 7–8). Lighter
-    pieces = white. Returns None if the starting setup looks inconclusive.
+    Warps the board (TL→top-left … BL→bottom-left). The calibrated *near* side
+    (rows 6–7) is the bot/machine side of the table; the far side (rows 0–1) is
+    the player. Lighter pieces = white. So lighter-on-near → bot is white →
+    human_is_white=False. Returns None if inconclusive.
     """
     warped = warp_board(frame_bgr, board_corners_px, out_size=400)
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
@@ -93,8 +94,8 @@ def detect_human_is_white(
                 vals.append(float(patch.mean()))
         return vals
 
-    near = rank_piece_brightness(range(6, 8))  # human side in TableLayout
-    far = rank_piece_brightness(range(0, 2))
+    near = rank_piece_brightness(range(6, 8))  # bot / machine side of table
+    far = rank_piece_brightness(range(0, 2))  # human side
     if len(near) < 4 or len(far) < 4:
         return None
     near_m = float(np.mean(near))
@@ -102,7 +103,8 @@ def detect_human_is_white(
     # Need a clear brightness gap between the two armies
     if abs(near_m - far_m) < 12.0:
         return None
-    return near_m > far_m  # lighter army on near side → human is white
+    bot_is_white = near_m > far_m
+    return not bot_is_white
 
 
 def warp_board(frame_bgr: np.ndarray, corners_px: np.ndarray, out_size: int = 400) -> np.ndarray:
