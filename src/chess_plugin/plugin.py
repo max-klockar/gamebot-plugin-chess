@@ -134,11 +134,15 @@ class ChessGameSession:
                 f"(you={side}, bot={bot_side})"
             )
             self.session.quick_start(guest, band, level, human_is_white=human_white)
-            # Sync camera to software board before watching for the human move
-            # (and again after each engine move once pieces are placed).
-            self._awaiting_sync = True
-            self._sync_stable = 0
-            self._prev_occ = None
+            # If bot moves first, do NOT block on camera sync or the arrow never appears
+            # (occupancy is still noisy on this board). Sync only after engine moves.
+            if human_white:
+                self._awaiting_sync = True
+                self._sync_stable = 0
+                self._prev_occ = None
+            else:
+                self._awaiting_sync = False
+                self._prev_occ = None
             return
         self.session.phase = Phase.PROFILE
 
@@ -287,20 +291,28 @@ class ChessGameSession:
         mismatch = occupancy_mismatch(result.grid, expected)
         self._dbg_tick += 1
 
-        # After engine (or start): wait until pieces match the software board.
+        # After engine: wait until pieces roughly match (or give up and watch deltas).
         if self._awaiting_sync:
-            if mismatch <= 2:
+            # Occupancy is imperfect on blue boards — allow a loose match, then timeout.
+            if mismatch <= 8:
                 self._sync_stable += 1
             else:
                 self._sync_stable = 0
             if self._dbg_tick % 45 == 0:
-                print(f"waiting for board sync… mismatch={mismatch}/64 (place bot piece if arrow showing)")
-            if self._sync_stable >= 5:
+                print(
+                    f"waiting for board sync… mismatch={mismatch}/64 "
+                    f"(place the blue-arrow piece, then your move)"
+                )
+            timed_out = self._dbg_tick > 0 and self._sync_stable == 0 and self._dbg_tick % 200 == 0
+            if self._sync_stable >= 5 or timed_out:
                 self._awaiting_sync = False
                 self._prev_occ = result.grid.copy()
                 self._pending_uci = None
                 self._pending_count = 0
-                print("board synced — your move" if s.is_human_turn() else "board synced")
+                if timed_out:
+                    print("board sync timed out — watching for your move anyway")
+                else:
+                    print("board synced — your move" if s.is_human_turn() else "board synced")
             return
 
         if not s.is_human_turn():
