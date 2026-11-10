@@ -40,29 +40,37 @@ class BoardOccupancyDetector:
         """board_corners_px: 4x2 TL, TR, BR, BL in camera pixels."""
         warped = warp_board(frame_bgr, board_corners_px, out_size=400)
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(blur, 40, 120)
         grid = np.zeros((8, 8), dtype=bool)
         conf = np.zeros((8, 8), dtype=np.float64)
         sq = warped.shape[0] // 8
         for r in range(8):
             for c in range(8):
                 y0, x0 = r * sq, c * sq
-                patch = gray[y0 + 4 : y0 + sq - 4, x0 + 4 : x0 + sq - 4]
+                # Inset avoids square borders / projected overlays
+                patch = gray[y0 + 6 : y0 + sq - 6, x0 + 6 : x0 + sq - 6]
+                epatch = edges[y0 + 6 : y0 + sq - 6, x0 + 6 : x0 + sq - 6]
                 if patch.size == 0:
                     continue
-                # Pieces create darker/lighter blobs vs empty wood texture
                 std = float(patch.std())
                 mean = float(patch.mean())
+                edge_density = float(epatch.mean())  # 0..255-ish after Canny
                 if empty_reference is not None:
                     ref = empty_reference[r, c]
                     score = abs(mean - ref)
-                    occupied = score > 18.0 and std > 8.0
-                    conf[r, c] = min(1.0, score / 40.0)
+                    occupied = (score > 14.0 and std > 6.0) or edge_density > 6.0
+                    conf[r, c] = min(1.0, max(score / 40.0, edge_density / 20.0))
                 else:
-                    # Heuristic: occupied squares have higher local std
-                    occupied = std > 22.0
-                    conf[r, c] = min(1.0, std / 40.0)
+                    # Pieces add edges + texture vs flat blue/white squares
+                    occupied = edge_density > 7.0 or std > 16.0
+                    conf[r, c] = min(1.0, max(edge_density / 20.0, std / 35.0))
                 grid[r, c] = occupied
         return OccupancyResult(grid=grid, confidence=conf)
+
+
+def occupancy_mismatch(a: np.ndarray, b: np.ndarray) -> int:
+    return int(np.count_nonzero(np.asarray(a) != np.asarray(b)))
 
 
 def detect_human_is_white(

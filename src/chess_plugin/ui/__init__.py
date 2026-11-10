@@ -70,16 +70,17 @@ def build_play_overlay(
     if engine_move is not None:
         x0, y0 = layout.square_center(engine_move.from_square)
         x1, y1 = layout.square_center(engine_move.to_square)
-        scene.add_arrow(x0, y0, x1, y1, (0, 220, 255))
+        # Bright blue (BGR) — readable on the blue board under the projector
+        scene.add_arrow(x0, y0, x1, y1, (255, 140, 20))
     for a, b in check_pairs:
         x0, y0 = layout.square_center(a)
         x1, y1 = layout.square_center(b)
-        scene.add_arrow(x0, y0, x1, y1, (0, 0, 255))
+        scene.add_arrow(x0, y0, x1, y1, (40, 40, 255))
     if revert is not None:
         x0, y0 = layout.square_center(revert[0])
         x1, y1 = layout.square_center(revert[1])
-        scene.add_arrow(x0, y0, x1, y1, (0, 0, 255))
-        scene.add_text("Illegal — move back", layout.margin_mm, layout.margin_mm - 30, (0, 0, 255))
+        scene.add_arrow(x0, y0, x1, y1, (40, 40, 255))
+        scene.add_text("Illegal — move back", layout.margin_mm, layout.margin_mm - 30, (40, 40, 255))
     if engine_promo_label:
         ox = layout.margin_mm + layout.board_size_mm + 40
         oy = layout.margin_mm + 40

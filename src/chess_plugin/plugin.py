@@ -20,6 +20,7 @@ from chess_plugin.vision import (
     detect_human_is_white,
     hypothesize_moves,
     occupancy_from_board,
+    occupancy_mismatch,
 )
 from gamebot.adapters.camera import MockCamera
 from gamebot.geometry import TableLayout
@@ -83,6 +84,11 @@ class ChessGameSession:
         self.occupancy = BoardOccupancyDetector(self.layout)
         self._prev_occ = None
         self._waiting_engine = False
+        self._awaiting_sync = False
+        self._sync_stable = 0
+        self._pending_uci: str | None = None
+        self._pending_count = 0
+        self._dbg_tick = 0
         self._exit = False
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
@@ -128,7 +134,11 @@ class ChessGameSession:
                 f"(you={side}, bot={bot_side})"
             )
             self.session.quick_start(guest, band, level, human_is_white=human_white)
-            self._prev_occ = occupancy_from_board(self.session.board)
+            # Sync camera to software board before watching for the human move
+            # (and again after each engine move once pieces are placed).
+            self._awaiting_sync = True
+            self._sync_stable = 0
+            self._prev_occ = None
             return
         self.session.phase = Phase.PROFILE
 
@@ -186,11 +196,15 @@ class ChessGameSession:
         if zone_id.startswith("level:"):
             s.human_is_white = self._resolve_human_is_white()
             s.select_skill_level(int(zone_id.split(":", 1)[1]))
-            self._prev_occ = occupancy_from_board(s.board)
+            self._awaiting_sync = True
+            self._sync_stable = 0
+            self._prev_occ = None
             return
         if zone_id.startswith("promo:"):
             s.confirm_promotion(int(zone_id.split(":", 1)[1]))
-            self._prev_occ = occupancy_from_board(s.board)
+            self._awaiting_sync = True
+            self._sync_stable = 0
+            self._prev_occ = None
             return
         if zone_id == "again":
             s.phase = Phase.PROFILE
@@ -208,9 +222,11 @@ class ChessGameSession:
 
     def tick(self, frame_bgr: np.ndarray) -> None:
         s = self.session
-        if s.phase == Phase.PLAY and s.is_human_turn():
+        if s.phase != Phase.PLAY:
+            return
+        if self._awaiting_sync or s.is_human_turn():
             self._poll_board_move(frame_bgr)
-        if s.phase == Phase.PLAY and not s.is_human_turn() and not self._waiting_engine:
+        if not s.is_human_turn() and not self._waiting_engine and not self._awaiting_sync:
             self._waiting_engine = True
             self._do_engine_turn()
             self._waiting_engine = False
@@ -229,11 +245,16 @@ class ChessGameSession:
             )
             result = self.engine.play(s.board, s.skill_level)
             s.apply_engine_move(result.move)
-            print(f"engine played {result.move.uci()}")
+            print(f"engine played {result.move.uci()} — place that piece, then your move")
             cam = self._camera
             if isinstance(cam, MockCamera):
                 cam.set_occupancy(occupancy_from_board(s.board))
-            self._prev_occ = occupancy_from_board(s.board)
+            # Wait until the physical board matches software (bot piece placed).
+            self._awaiting_sync = True
+            self._sync_stable = 0
+            self._prev_occ = None
+            self._pending_uci = None
+            self._pending_count = 0
         except Exception as exc:  # noqa: BLE001 — keep session alive
             print(f"engine turn failed: {exc}")
         finally:
@@ -252,24 +273,75 @@ class ChessGameSession:
         cam = self._camera
         if isinstance(cam, MockCamera):
             cam.set_occupancy(occupancy_from_board(s.board))
-        self._prev_occ = occupancy_from_board(s.board)
+        self._awaiting_sync = True
+        self._sync_stable = 0
+        self._prev_occ = None
 
     def _poll_board_move(self, frame_bgr: np.ndarray) -> None:
         s = self.session
         cal = self._calibration
-        if not s.is_human_turn() or cal is None:
+        if cal is None or s.phase != Phase.PLAY:
             return
         result = self.occupancy.detect(frame_bgr, cal.board_corners_camera)
-        if self._prev_occ is None:
-            self._prev_occ = result.grid
+        expected = occupancy_from_board(s.board)
+        mismatch = occupancy_mismatch(result.grid, expected)
+        self._dbg_tick += 1
+
+        # After engine (or start): wait until pieces match the software board.
+        if self._awaiting_sync:
+            if mismatch <= 2:
+                self._sync_stable += 1
+            else:
+                self._sync_stable = 0
+            if self._dbg_tick % 45 == 0:
+                print(f"waiting for board sync… mismatch={mismatch}/64 (place bot piece if arrow showing)")
+            if self._sync_stable >= 5:
+                self._awaiting_sync = False
+                self._prev_occ = result.grid.copy()
+                self._pending_uci = None
+                self._pending_count = 0
+                print("board synced — your move" if s.is_human_turn() else "board synced")
             return
+
+        if not s.is_human_turn():
+            return
+        if self._prev_occ is None:
+            self._prev_occ = result.grid.copy()
+            return
+
+        # Hand over board → too many squares flip; ignore.
+        changed = occupancy_mismatch(self._prev_occ, result.grid)
+        if changed > 4:
+            if self._dbg_tick % 30 == 0:
+                print(f"move watch: noisy delta={changed} (hand?) — ignoring")
+            self._pending_uci = None
+            self._pending_count = 0
+            return
+
         hyps = hypothesize_moves(self._prev_occ, result.grid, s.board)
         if not hyps:
+            if changed > 0 and self._dbg_tick % 30 == 0:
+                print(f"move watch: delta={changed} but no legal match yet")
+            self._pending_uci = None
+            self._pending_count = 0
             return
         if len(hyps) > 1 and hyps[0].score - hyps[1].score < 0.05:
             return
+
+        uci = hyps[0].move.uci()
+        if uci == self._pending_uci:
+            self._pending_count += 1
+        else:
+            self._pending_uci = uci
+            self._pending_count = 1
+        if self._pending_count < 4:
+            return
         if s.try_human_move(hyps[0].move):
-            self._prev_occ = occupancy_from_board(s.board)
+            print(f"human move detected: {uci}")
+            self._prev_occ = result.grid.copy()
+            self._pending_uci = None
+            self._pending_count = 0
+            # Next engine move will set awaiting_sync again.
 
 
 class ChessPlugin:
