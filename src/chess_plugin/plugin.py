@@ -6,7 +6,7 @@ import numpy as np
 
 from chess_plugin.db import Database
 from chess_plugin.engine import ChessEngine
-from chess_plugin.game import BAND_LEVEL_RANGES, ChessSession, Phase, SkillBand
+from chess_plugin.game import BAND_LEVEL_RANGES, ChessSession, Phase, SkillBand, elo_to_skill
 from chess_plugin.ui import (
     build_band_scene,
     build_level_scene,
@@ -84,6 +84,16 @@ class ChessGameSession:
 
     def on_enter(self) -> None:
         self.engine.open()
+        elo = getattr(self.runtime.config, "quick_start_elo", None)
+        if elo is not None:
+            guest = next((p for p in self.db.list_profiles() if p.name == "Guest"), None)
+            if guest is None:
+                guest = self.db.create_profile("Guest", "beginner", 1)
+            band, level = elo_to_skill(int(elo))
+            print(f"quick start: Guest @ ~{elo} Elo → {band.value} level {level}")
+            self.session.quick_start(guest, band, level)
+            self._prev_occ = occupancy_from_board(self.session.board)
+            return
         self.session.phase = Phase.PROFILE
 
     def wants_exit(self) -> bool:

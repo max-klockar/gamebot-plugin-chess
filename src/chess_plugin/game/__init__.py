@@ -34,6 +34,27 @@ def skill_to_stockfish(skill_level: int) -> tuple[int, int]:
     return sf_skill, movetime
 
 
+def elo_to_skill(elo: int) -> tuple[SkillBand, int]:
+    """Rough rating → coaching band + level 1–10 (for --elo quick start)."""
+    elo = int(elo)
+    brackets: list[tuple[int, SkillBand, int]] = [
+        (600, SkillBand.BEGINNER, 1),
+        (800, SkillBand.BEGINNER, 2),
+        (1000, SkillBand.BEGINNER, 3),
+        (1200, SkillBand.INTERMEDIATE, 4),
+        (1400, SkillBand.INTERMEDIATE, 5),
+        (1600, SkillBand.INTERMEDIATE, 6),
+        (1800, SkillBand.ADVANCED, 7),
+        (2000, SkillBand.ADVANCED, 8),
+        (2200, SkillBand.EXPERT, 9),
+        (10_000, SkillBand.EXPERT, 10),
+    ]
+    for hi, band, level in brackets:
+        if elo < hi:
+            return band, level
+    return SkillBand.EXPERT, 10
+
+
 @dataclass
 class CheckHighlight:
     from_sq: chess.Square
@@ -115,6 +136,18 @@ class ChessSession:
         self.skill_level = level
         if self.profile is not None:
             self.db.update_profile_skill(self.profile.id, self.skill_band.value, level)
+        self._start_game()
+
+    def quick_start(self, profile: Profile, band: SkillBand, level: int) -> None:
+        """Skip menus — start a game at the given strength."""
+        self.profile = profile
+        self.skill_band = band
+        self.skill_level = level
+        if level not in BAND_LEVEL_RANGES[band]:
+            # Clamp into band if caller passed a mismatched pair.
+            levels = list(BAND_LEVEL_RANGES[band])
+            self.skill_level = min(levels, key=lambda x: abs(x - level))
+        self.db.update_profile_skill(profile.id, self.skill_band.value, self.skill_level)
         self._start_game()
 
     def _start_game(self) -> None:
