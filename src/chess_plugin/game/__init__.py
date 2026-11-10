@@ -144,12 +144,9 @@ class ChessSession:
         band: SkillBand,
         level: int,
         *,
-        human_is_white: bool = False,
+        human_is_white: bool = True,
     ) -> None:
-        """Skip menus — start a game at the given strength.
-
-        Default: bot is white and moves first (kid-friendly / --elo).
-        """
+        """Skip menus — start a game at the given strength."""
         self.profile = profile
         self.skill_band = band
         self.skill_level = level

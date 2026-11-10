@@ -65,6 +65,46 @@ class BoardOccupancyDetector:
         return OccupancyResult(grid=grid, confidence=conf)
 
 
+def detect_human_is_white(
+    frame_bgr: np.ndarray,
+    board_corners_px: np.ndarray,
+) -> bool | None:
+    """Infer whether the human (near / bottom side of the calibrated board) plays white.
+
+    Warps the board (TL→top-left … BL→bottom-left). Compares piece brightness on the
+    near ranks (rows 6–7 ≈ ranks 1–2) vs far ranks (rows 0–1 ≈ ranks 7–8). Lighter
+    pieces = white. Returns None if the starting setup looks inconclusive.
+    """
+    warped = warp_board(frame_bgr, board_corners_px, out_size=400)
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    sq = warped.shape[0] // 8
+
+    def rank_piece_brightness(rows: range) -> list[float]:
+        vals: list[float] = []
+        for r in rows:
+            for c in range(8):
+                y0, x0 = r * sq, c * sq
+                patch = gray[y0 + 6 : y0 + sq - 6, x0 + 6 : x0 + sq - 6]
+                if patch.size < 16:
+                    continue
+                # Occupied-ish: higher texture than empty blue/white squares alone
+                if float(patch.std()) < 12.0:
+                    continue
+                vals.append(float(patch.mean()))
+        return vals
+
+    near = rank_piece_brightness(range(6, 8))  # human side in TableLayout
+    far = rank_piece_brightness(range(0, 2))
+    if len(near) < 4 or len(far) < 4:
+        return None
+    near_m = float(np.mean(near))
+    far_m = float(np.mean(far))
+    # Need a clear brightness gap between the two armies
+    if abs(near_m - far_m) < 12.0:
+        return None
+    return near_m > far_m  # lighter army on near side → human is white
+
+
 def warp_board(frame_bgr: np.ndarray, corners_px: np.ndarray, out_size: int = 400) -> np.ndarray:
     src = np.asarray(corners_px, dtype=np.float32)
     dst = np.array(

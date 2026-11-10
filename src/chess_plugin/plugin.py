@@ -15,7 +15,12 @@ from chess_plugin.ui import (
     build_promotion_scene,
     load_icon,
 )
-from chess_plugin.vision import BoardOccupancyDetector, hypothesize_moves, occupancy_from_board
+from chess_plugin.vision import (
+    BoardOccupancyDetector,
+    detect_human_is_white,
+    hypothesize_moves,
+    occupancy_from_board,
+)
 from gamebot.adapters.camera import MockCamera
 from gamebot.geometry import TableLayout
 from gamebot.plugins.protocol import IdentifyContext, RuntimeHandles
@@ -82,6 +87,28 @@ class ChessGameSession:
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
 
+    def _resolve_human_is_white(self) -> bool:
+        """Camera: which army sits on the near side of the board? Fallback: human=white."""
+        cal = self._calibration
+        cam = self._camera
+        if cal is None or cam is None:
+            print("side detect: no camera/cal — assuming human=white")
+            return True
+        try:
+            frame = cam.read()
+            # Settle a couple frames
+            for _ in range(2):
+                frame = cam.read()
+            found = detect_human_is_white(frame, cal.board_corners_camera)
+        except Exception as exc:  # noqa: BLE001
+            print(f"side detect failed ({exc}) — assuming human=white")
+            return True
+        if found is None:
+            print("side detect inconclusive — assuming human=white")
+            return True
+        print(f"side detect: human_is_white={found} (lighter pieces on near side={found})")
+        return found
+
     def on_enter(self) -> None:
         self.engine.open()
         elo = getattr(self.runtime.config, "quick_start_elo", None)
@@ -90,9 +117,14 @@ class ChessGameSession:
             if guest is None:
                 guest = self.db.create_profile("Guest", "beginner", 1)
             band, level = elo_to_skill(int(elo))
-            # Bot plays white and moves first so the table isn't stuck waiting for a human move.
-            print(f"quick start: Guest @ ~{elo} Elo → {band.value} level {level} (bot=white)")
-            self.session.quick_start(guest, band, level, human_is_white=False)
+            human_white = self._resolve_human_is_white()
+            side = "white" if human_white else "black"
+            bot_side = "black" if human_white else "white"
+            print(
+                f"quick start: Guest @ ~{elo} Elo → {band.value} level {level} "
+                f"(you={side}, bot={bot_side})"
+            )
+            self.session.quick_start(guest, band, level, human_is_white=human_white)
             self._prev_occ = occupancy_from_board(self.session.board)
             return
         self.session.phase = Phase.PROFILE
@@ -149,6 +181,7 @@ class ChessGameSession:
             s.select_skill_band(SkillBand(zone_id.split(":", 1)[1]))
             return
         if zone_id.startswith("level:"):
+            s.human_is_white = self._resolve_human_is_white()
             s.select_skill_level(int(zone_id.split(":", 1)[1]))
             self._prev_occ = occupancy_from_board(s.board)
             return
