@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 import chess
 import chess.engine
@@ -25,7 +26,9 @@ class ChessEngine:
         threads: int = 2,
         hash_mb: int = 64,
     ) -> None:
-        self.path = path or shutil.which("stockfish")
+        self.path = path or shutil.which("stockfish") or (
+            "/usr/games/stockfish" if Path("/usr/games/stockfish").is_file() else None
+        )
         self.threads = threads
         self.hash_mb = hash_mb
         self._engine: chess.engine.SimpleEngine | None = None

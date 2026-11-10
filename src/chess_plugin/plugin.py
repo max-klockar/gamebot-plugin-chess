@@ -90,8 +90,9 @@ class ChessGameSession:
             if guest is None:
                 guest = self.db.create_profile("Guest", "beginner", 1)
             band, level = elo_to_skill(int(elo))
-            print(f"quick start: Guest @ ~{elo} Elo → {band.value} level {level}")
-            self.session.quick_start(guest, band, level)
+            # Bot plays white and moves first so the table isn't stuck waiting for a human move.
+            print(f"quick start: Guest @ ~{elo} Elo → {band.value} level {level} (bot=white)")
+            self.session.quick_start(guest, band, level, human_is_white=False)
             self._prev_occ = occupancy_from_board(self.session.board)
             return
         self.session.phase = Phase.PROFILE
@@ -126,7 +127,12 @@ class ChessGameSession:
         promo_label = None
         if s.last_engine_promotion:
             promo_label = chess.piece_symbol(s.last_engine_promotion).upper()
-        return build_play_overlay(layout, s.last_engine_move, checks, revert, promo_label)
+        scene = build_play_overlay(layout, s.last_engine_move, checks, revert, promo_label)
+        if s.is_human_turn():
+            scene.add_text("Your move", layout.margin_mm, layout.margin_mm - 28, (220, 220, 80))
+        else:
+            scene.add_text("Bot thinking…", layout.margin_mm, layout.margin_mm - 28, (200, 120, 255))
+        return scene
 
     def handle_zone(self, zone_id: str) -> None:
         s = self.session
@@ -181,12 +187,19 @@ class ChessGameSession:
         if callable(thinking):
             thinking(True)
         try:
+            print(
+                f"engine move… stockfish={'yes' if self.engine.available else 'fallback'} "
+                f"skill={s.skill_level}"
+            )
             result = self.engine.play(s.board, s.skill_level)
             s.apply_engine_move(result.move)
+            print(f"engine played {result.move.uci()}")
             cam = self._camera
             if isinstance(cam, MockCamera):
                 cam.set_occupancy(occupancy_from_board(s.board))
             self._prev_occ = occupancy_from_board(s.board)
+        except Exception as exc:  # noqa: BLE001 — keep session alive
+            print(f"engine turn failed: {exc}")
         finally:
             if callable(thinking):
                 thinking(False)

@@ -138,11 +138,22 @@ class ChessSession:
             self.db.update_profile_skill(self.profile.id, self.skill_band.value, level)
         self._start_game()
 
-    def quick_start(self, profile: Profile, band: SkillBand, level: int) -> None:
-        """Skip menus — start a game at the given strength."""
+    def quick_start(
+        self,
+        profile: Profile,
+        band: SkillBand,
+        level: int,
+        *,
+        human_is_white: bool = False,
+    ) -> None:
+        """Skip menus — start a game at the given strength.
+
+        Default: bot is white and moves first (kid-friendly / --elo).
+        """
         self.profile = profile
         self.skill_band = band
         self.skill_level = level
+        self.human_is_white = human_is_white
         if level not in BAND_LEVEL_RANGES[band]:
             # Clamp into band if caller passed a mismatched pair.
             levels = list(BAND_LEVEL_RANGES[band])
