@@ -21,8 +21,11 @@ from chess_plugin.vision import (
     hypothesize_moves,
     occupancy_from_board,
     occupancy_mismatch,
+    setup_from_corner_pieces,
+    warp_board,
 )
 from gamebot.adapters.camera import MockCamera
+from gamebot.calibration import estimate_homography
 from gamebot.geometry import TableLayout
 from gamebot.plugins.protocol import IdentifyContext, RuntimeHandles
 from gamebot.ui import Scene
@@ -93,29 +96,81 @@ class ChessGameSession:
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
 
-    def _resolve_human_is_white(self) -> bool:
-        """Camera: which army sits on the near side of the board? Fallback: human=white."""
+    def _apply_board_corners(self, board_cam: np.ndarray) -> None:
+        """Update calibration so table↔camera↔projector match the piece-defined board."""
+        cal = self._calibration
+        if cal is None:
+            return
+        table = self.layout.board_corners()
+        H_t2c = estimate_homography(table, board_cam)
+        if H_t2c is None:
+            return
+        H_t2p = cal.H_camera_to_projector @ H_t2c
+        cal.board_corners_camera = np.asarray(board_cam, dtype=np.float64)
+        cal.H_table_to_camera = H_t2c
+        cal.H_table_to_projector = H_t2p
+        # Host renderer follows projector H when present
+        renderer = getattr(self.runtime, "renderer", None)
+        if renderer is not None and hasattr(renderer, "set_homography"):
+            renderer.set_homography(H_t2p)
+        path = getattr(self.runtime.config, "calibration_path", None)
+        if path is not None:
+            try:
+                cal.save(path)
+            except Exception as exc:  # noqa: BLE001
+                print(f"could not save updated board corners: {exc}")
+
+    def _capture_empty_reference(self, frame_bgr: np.ndarray) -> None:
+        cal = self._calibration
+        if cal is None:
+            return
+        warped = warp_board(frame_bgr, cal.board_corners_camera, out_size=400)
+        self.occupancy.set_empty_reference_from_warped(warped)
+        print("occupancy: empty-square reference captured (board ROI only)")
+
+    def _resolve_setup_from_camera(self) -> bool:
+        """Prefer 2 corner pieces (white+black) for board pose + colour; else army brightness."""
         cal = self._calibration
         cam = self._camera
         if cal is None or cam is None:
-            print("side detect: no camera/cal — assuming human=white")
+            print("setup: no camera/cal — assuming human=white")
+            self.session.human_is_white = True
             return True
-        try:
+        frame = cam.read()
+        for _ in range(3):
             frame = cam.read()
-            # Settle a couple frames
-            for _ in range(2):
-                frame = cam.read()
-            found = detect_human_is_white(frame, cal.board_corners_camera)
-        except Exception as exc:  # noqa: BLE001
-            print(f"side detect failed ({exc}) — assuming human=white")
-            return True
+
+        # 1) Two pieces on opposite corners → board size/pose + which side is white
+        roi = cal.board_corners_camera
+        setup = setup_from_corner_pieces(frame, search_roi=roi)
+        if setup is None:
+            # Widen search to full frame once (pieces may be outside old cal quad)
+            setup = setup_from_corner_pieces(frame, search_roi=None)
+        if setup is not None:
+            self._apply_board_corners(setup.board_corners_px)
+            self.session.human_is_white = setup.human_is_white
+            print(
+                f"corner pieces: white@({setup.white_xy[0]:.0f},{setup.white_xy[1]:.0f}) "
+                f"black@({setup.black_xy[0]:.0f},{setup.black_xy[1]:.0f}) → "
+                f"bot={'white' if setup.bot_is_white else 'black'} "
+                f"you={'white' if setup.human_is_white else 'black'}"
+            )
+            self._capture_empty_reference(frame)
+            return setup.human_is_white
+
+        # 2) Fallback: brightness of armies on near vs far ranks
+        found = detect_human_is_white(frame, cal.board_corners_camera)
         if found is None:
-            print("side detect inconclusive — assuming human=white")
+            print("setup: inconclusive — assuming human=white")
+            self.session.human_is_white = True
+            self._capture_empty_reference(frame)
             return True
+        self.session.human_is_white = found
         print(
             f"side detect: human_is_white={found} "
-            f"(near=bot side; lighter-on-near → bot white → human_is_white={found})"
+            f"(near=bot side; lighter-on-near → bot white)"
         )
+        self._capture_empty_reference(frame)
         return found
 
     def on_enter(self) -> None:
@@ -126,7 +181,7 @@ class ChessGameSession:
             if guest is None:
                 guest = self.db.create_profile("Guest", "beginner", 1)
             band, level = elo_to_skill(int(elo))
-            human_white = self._resolve_human_is_white()
+            human_white = self._resolve_setup_from_camera()
             side = "white" if human_white else "black"
             bot_side = "black" if human_white else "white"
             print(
@@ -134,8 +189,7 @@ class ChessGameSession:
                 f"(you={side}, bot={bot_side})"
             )
             self.session.quick_start(guest, band, level, human_is_white=human_white)
-            # If bot moves first, do NOT block on camera sync or the arrow never appears
-            # (occupancy is still noisy on this board). Sync only after engine moves.
+            # If bot moves first, do NOT block on camera sync or the arrow never appears.
             if human_white:
                 self._awaiting_sync = True
                 self._sync_stable = 0
@@ -198,7 +252,7 @@ class ChessGameSession:
             s.select_skill_band(SkillBand(zone_id.split(":", 1)[1]))
             return
         if zone_id.startswith("level:"):
-            s.human_is_white = self._resolve_human_is_white()
+            self._resolve_setup_from_camera()
             s.select_skill_level(int(zone_id.split(":", 1)[1]))
             self._awaiting_sync = True
             self._sync_stable = 0

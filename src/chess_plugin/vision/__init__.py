@@ -13,6 +13,7 @@ from gamebot.geometry import TableLayout
 class OccupancyResult:
     grid: np.ndarray  # 8x8 bool
     confidence: np.ndarray  # 8x8 float
+    warped_bgr: np.ndarray | None = None
 
 
 @dataclass
@@ -21,15 +22,169 @@ class MoveHypothesis:
     score: float
 
 
+@dataclass
+class CornerPieceSetup:
+    """White + black pieces on opposite board corners define pose + colour."""
+
+    white_xy: tuple[float, float]
+    black_xy: tuple[float, float]
+    board_corners_px: np.ndarray  # TL,TR,BR,BL
+    human_is_white: bool
+    bot_is_white: bool
+
+
+def _largest_blob(
+    mask: np.ndarray,
+    *,
+    min_area: float = 80.0,
+    max_area: float = 25000.0,
+) -> tuple[tuple[float, float], float] | None:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_xy: tuple[float, float] | None = None
+    best_area = min_area
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area < best_area or area > max_area:
+            continue
+        m = cv2.moments(cnt)
+        if m["m00"] == 0:
+            continue
+        best_xy = (m["m10"] / m["m00"], m["m01"] / m["m00"])
+        best_area = area
+    if best_xy is None:
+        return None
+    return best_xy, best_area
+
+
+def detect_white_black_pieces(
+    frame_bgr: np.ndarray,
+    search_roi: np.ndarray | None = None,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Find one bright (white) and one dark (black) piece blob in the frame/ROI."""
+    work = frame_bgr
+    offset = np.array([0.0, 0.0])
+    if search_roi is not None and len(search_roi) >= 4:
+        # Axis-aligned crop around the ROI to ignore room clutter.
+        xs = search_roi[:, 0]
+        ys = search_roi[:, 1]
+        x0 = max(0, int(xs.min()) - 20)
+        y0 = max(0, int(ys.min()) - 20)
+        x1 = min(frame_bgr.shape[1], int(xs.max()) + 20)
+        y1 = min(frame_bgr.shape[0], int(ys.max()) + 20)
+        if x1 - x0 < 40 or y1 - y0 < 40:
+            return None
+        work = frame_bgr[y0:y1, x0:x1]
+        offset = np.array([float(x0), float(y0)])
+
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    # White piece: very bright compact blob
+    white_thr = max(170.0, float(np.percentile(blur, 92)))
+    white_mask = cv2.threshold(blur, white_thr, 255, cv2.THRESH_BINARY)[1]
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    # Black piece: very dark compact blob
+    black_thr = min(80.0, float(np.percentile(blur, 12)))
+    black_mask = cv2.threshold(blur, black_thr, 255, cv2.THRESH_BINARY_INV)[1]
+    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+
+    w = _largest_blob(white_mask)
+    b = _largest_blob(black_mask)
+    if w is None or b is None:
+        return None
+    wxy = (w[0][0] + offset[0], w[0][1] + offset[1])
+    bxy = (b[0][0] + offset[0], b[0][1] + offset[1])
+    if float(np.linalg.norm(np.array(wxy) - np.array(bxy))) < 40.0:
+        return None
+    return wxy, bxy
+
+
+def board_quad_from_opposite_corners(
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> np.ndarray:
+    """Square board outer quad (TL,TR,BR,BL) from two opposite corner points."""
+    a_xy = np.asarray(a, dtype=np.float64)
+    b_xy = np.asarray(b, dtype=np.float64)
+    mid = 0.5 * (a_xy + b_xy)
+    half = 0.5 * (b_xy - a_xy)
+    perp = np.array([-half[1], half[0]], dtype=np.float64)
+    corners = np.array([a_xy, mid + perp, b_xy, mid - perp], dtype=np.float64)
+    # Spatial order to TL,TR,BR,BL
+    by_y = corners[np.argsort(corners[:, 1])]
+    top = by_y[:2][np.argsort(by_y[:2, 0])]
+    bot = by_y[2:][np.argsort(by_y[2:, 0])]
+    return np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float64)
+
+
+def setup_from_corner_pieces(
+    frame_bgr: np.ndarray,
+    search_roi: np.ndarray | None = None,
+) -> CornerPieceSetup | None:
+    """Use one white + one black piece on opposite corners to set board + colour.
+
+    Rule: white piece on the near (bottom) half of the board quad ⇒ bot is white
+    (near = machine/bot side of the table).
+    """
+    found = detect_white_black_pieces(frame_bgr, search_roi=search_roi)
+    if found is None:
+        return None
+    white_xy, black_xy = found
+    board = board_quad_from_opposite_corners(white_xy, black_xy)
+    # Near side = bottom edge midpoint of ordered quad
+    near_mid = 0.5 * (board[2] + board[3])
+    far_mid = 0.5 * (board[0] + board[1])
+    white = np.asarray(white_xy, dtype=np.float64)
+    dist_near = float(np.linalg.norm(white - near_mid))
+    dist_far = float(np.linalg.norm(white - far_mid))
+    bot_is_white = dist_near <= dist_far
+    return CornerPieceSetup(
+        white_xy=white_xy,
+        black_xy=black_xy,
+        board_corners_px=board,
+        human_is_white=not bot_is_white,
+        bot_is_white=bot_is_white,
+    )
+
+
 class BoardOccupancyDetector:
     """Estimate occupied squares from a top-down board image.
 
-    Uses average dark/light deviation vs empty-square baseline when provided;
-    otherwise thresholds local contrast inside each square ROI.
+    Always warps to the board quad first (ignores everything outside the frame).
+    Prefers an empty-square brightness reference when available.
     """
 
     def __init__(self, layout: TableLayout | None = None) -> None:
         self.layout = layout or TableLayout()
+        self.empty_reference: np.ndarray | None = None
+
+    def set_empty_reference_from_warped(self, warped_bgr: np.ndarray) -> None:
+        """Build empty-square baseline from the board ROI only.
+
+        Uses the middle ranks (usually empty in the starting position) to learn
+        light/dark square brightness, then fills an 8x8 checker reference.
+        """
+        gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+        sq = warped_bgr.shape[0] // 8
+        means = np.zeros((8, 8), dtype=np.float64)
+        for r in range(8):
+            for c in range(8):
+                patch = gray[r * sq + 6 : (r + 1) * sq - 6, c * sq + 6 : (c + 1) * sq - 6]
+                means[r, c] = float(patch.mean()) if patch.size else 0.0
+        light: list[float] = []
+        dark: list[float] = []
+        for r in range(2, 6):  # ranks that are empty at start
+            for c in range(8):
+                if (r + c) % 2 == 0:
+                    light.append(float(means[r, c]))
+                else:
+                    dark.append(float(means[r, c]))
+        light_m = float(np.median(light)) if light else float(np.median(means))
+        dark_m = float(np.median(dark)) if dark else float(np.median(means))
+        ref = np.zeros((8, 8), dtype=np.float64)
+        for r in range(8):
+            for c in range(8):
+                ref[r, c] = light_m if (r + c) % 2 == 0 else dark_m
+        self.empty_reference = ref
 
     def detect(
         self,
@@ -37,36 +192,37 @@ class BoardOccupancyDetector:
         board_corners_px: np.ndarray,
         empty_reference: np.ndarray | None = None,
     ) -> OccupancyResult:
-        """board_corners_px: 4x2 TL, TR, BR, BL in camera pixels."""
+        """board_corners_px: 4x2 TL, TR, BR, BL in camera pixels — analysis is board-only."""
         warped = warp_board(frame_bgr, board_corners_px, out_size=400)
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blur, 40, 120)
+        edges = cv2.Canny(blur, 50, 140)
+        ref = empty_reference if empty_reference is not None else self.empty_reference
         grid = np.zeros((8, 8), dtype=bool)
         conf = np.zeros((8, 8), dtype=np.float64)
         sq = warped.shape[0] // 8
         for r in range(8):
             for c in range(8):
                 y0, x0 = r * sq, c * sq
-                # Inset avoids square borders / projected overlays
-                patch = gray[y0 + 6 : y0 + sq - 6, x0 + 6 : x0 + sq - 6]
-                epatch = edges[y0 + 6 : y0 + sq - 6, x0 + 6 : x0 + sq - 6]
-                if patch.size == 0:
+                # Strong inset: only the square interior (cuts border + projector lines)
+                inset = max(8, sq // 5)
+                patch = gray[y0 + inset : y0 + sq - inset, x0 + inset : x0 + sq - inset]
+                epatch = edges[y0 + inset : y0 + sq - inset, x0 + inset : x0 + sq - inset]
+                if patch.size < 16:
                     continue
                 std = float(patch.std())
                 mean = float(patch.mean())
-                edge_density = float(epatch.mean())  # 0..255-ish after Canny
-                if empty_reference is not None:
-                    ref = empty_reference[r, c]
-                    score = abs(mean - ref)
-                    occupied = (score > 14.0 and std > 6.0) or edge_density > 6.0
-                    conf[r, c] = min(1.0, max(score / 40.0, edge_density / 20.0))
+                edge_density = float(epatch.mean())
+                if ref is not None:
+                    score = abs(mean - float(ref[r, c]))
+                    # Piece vs empty square: brightness shift and/or extra edges
+                    occupied = score > 18.0 or (edge_density > 9.0 and std > 10.0)
+                    conf[r, c] = min(1.0, max(score / 45.0, edge_density / 22.0))
                 else:
-                    # Pieces add edges + texture vs flat blue/white squares
-                    occupied = edge_density > 7.0 or std > 16.0
-                    conf[r, c] = min(1.0, max(edge_density / 20.0, std / 35.0))
+                    occupied = edge_density > 10.0 or std > 18.0
+                    conf[r, c] = min(1.0, max(edge_density / 22.0, std / 35.0))
                 grid[r, c] = occupied
-        return OccupancyResult(grid=grid, confidence=conf)
+        return OccupancyResult(grid=grid, confidence=conf, warped_bgr=warped)
 
 
 def occupancy_mismatch(a: np.ndarray, b: np.ndarray) -> int:
