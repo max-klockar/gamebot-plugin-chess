@@ -59,63 +59,6 @@ def _crop_roi(
     return frame_bgr[y0:y1, x0:x1], np.array([float(x0), float(y0)])
 
 
-def _piece_candidates(
-    gray: np.ndarray,
-    mask: np.ndarray,
-    *,
-    want_bright: bool,
-    min_area: float,
-    max_area: float,
-    edge_margin: int = 8,
-) -> list[PieceBlob]:
-    """Compact round blobs only — rejects glare strips and shadow puddles."""
-    h, w = gray.shape[:2]
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    out: list[PieceBlob] = []
-    for cnt in contours:
-        area = float(cv2.contourArea(cnt))
-        if area < min_area or area > max_area:
-            continue
-        peri = cv2.arcLength(cnt, True)
-        if peri < 1e-3:
-            continue
-        circularity = float(4.0 * np.pi * area / (peri * peri))
-        if circularity < 0.55:
-            continue
-        (_cx, _cy), (bw, bh), _ang = cv2.minAreaRect(cnt)
-        if bw < 1 or bh < 1:
-            continue
-        aspect = max(bw, bh) / min(bw, bh)
-        if aspect > 1.75:
-            continue
-        m = cv2.moments(cnt)
-        if m["m00"] == 0:
-            continue
-        cx = m["m10"] / m["m00"]
-        cy = m["m01"] / m["m00"]
-        if cx < edge_margin or cy < edge_margin or cx > w - edge_margin or cy > h - edge_margin:
-            continue
-        x, y, rw, rh = cv2.boundingRect(cnt)
-        patch = gray[y : y + rh, x : x + rw]
-        if patch.size == 0:
-            continue
-        # Mean only inside the contour (bbox would dilute with background)
-        cnt_local = cnt - np.array([[x, y]])
-        local_mask = np.zeros(patch.shape, dtype=np.uint8)
-        cv2.drawContours(local_mask, [cnt_local], -1, 255, -1)
-        mean_g = float(cv2.mean(patch, mask=local_mask)[0])
-        if want_bright and mean_g < 150:
-            continue
-        if not want_bright and mean_g > 85:
-            continue
-        # Prefer round + extreme brightness
-        extreme = mean_g / 255.0 if want_bright else (1.0 - mean_g / 255.0)
-        score = circularity * extreme * min(1.0, area / 400.0)
-        out.append(PieceBlob((cx, cy), area, score, mean_g))
-    out.sort(key=lambda b: b.score, reverse=True)
-    return out
-
-
 def _nms_blobs(blobs: list[PieceBlob], max_keep: int, min_dist: float) -> list[PieceBlob]:
     """Keep highest-score blobs that are spatially separated (one per piece)."""
     kept: list[PieceBlob] = []
@@ -128,45 +71,135 @@ def _nms_blobs(blobs: list[PieceBlob], max_keep: int, min_dist: float) -> list[P
     return kept
 
 
+def _table_surface_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    """Largest greenish mid-tone region (play table), dilated; full frame if unsure."""
+    b, g, r = cv2.split(frame_bgr)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    raw = (
+        (g.astype(np.int16) >= r.astype(np.int16) - 8)
+        & (g.astype(np.int16) >= b.astype(np.int16) - 20)
+        & (gray >= 75)
+        & (gray <= 210)
+    ).astype(np.uint8) * 255
+    raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8))
+    raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, np.ones((25, 25), np.uint8))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(raw)
+    h, w = gray.shape[:2]
+    if n <= 1:
+        return np.full((h, w), 255, dtype=np.uint8)
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    mask = (labels == largest).astype(np.uint8) * 255
+    if int((mask > 0).sum()) < h * w * 0.04:
+        return np.full((h, w), 255, dtype=np.uint8)
+    # Mild inward shrink drops person/rim clutter; dilate so pieces on the cloth remain.
+    core = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+    if int((core > 0).sum()) < h * w * 0.02:
+        core = mask
+    return cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+
+
+def _blobs_from_response(
+    frame_bgr: np.ndarray,
+    gray: np.ndarray,
+    resp: np.ndarray,
+    surface: np.ndarray,
+    *,
+    thr: int,
+    want_bright: bool,
+    min_area: float,
+    max_area: float,
+    min_circ: float = 0.58,
+) -> list[PieceBlob]:
+    """Round local tophat/blackhat peaks on the table surface."""
+    h, w = gray.shape[:2]
+    gated = resp.copy()
+    gated[surface == 0] = 0
+    mask = (gated >= thr).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    # Slight dilate so soft wood tops become one contour, not a speck.
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    b, _g, r = cv2.split(frame_bgr)
+    out: list[PieceBlob] = []
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area < min_area or area > max_area:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        if peri < 1e-3:
+            continue
+        circularity = float(4.0 * np.pi * area / (peri * peri))
+        if circularity < min_circ:
+            continue
+        (_cx, _cy), (bw, bh), _ang = cv2.minAreaRect(cnt)
+        if bw < 1 or bh < 1:
+            continue
+        if max(bw, bh) / min(bw, bh) > 1.7:
+            continue
+        m = cv2.moments(cnt)
+        if m["m00"] == 0:
+            continue
+        cx = float(m["m10"] / m["m00"])
+        cy = float(m["m01"] / m["m00"])
+        if cx < 6 or cy < 6 or cx > w - 6 or cy > h - 6:
+            continue
+        ix, iy = int(cx), int(cy)
+        mean_g = float(gray[iy, ix])
+        resp_v = float(gated[iy, ix])
+        if want_bright:
+            if mean_g < 100:
+                continue
+            # Cream wood is warm (R>B). Reject cyan projected squares.
+            if int(b[iy, ix]) > int(r[iy, ix]) + 22 and mean_g > 165:
+                continue
+            score = circularity * (mean_g / 255.0) * min(1.0, area / 220.0) * min(1.5, resp_v / 28.0)
+        else:
+            if mean_g > 120:
+                continue
+            score = circularity * (1.0 - mean_g / 255.0) * min(1.0, area / 220.0) * min(1.5, resp_v / 45.0)
+        out.append(PieceBlob((cx, cy), area, float(score), mean_g))
+    out.sort(key=lambda blob: blob.score, reverse=True)
+    return out
+
+
 def find_piece_blobs(
     frame_bgr: np.ndarray,
     search_roi: np.ndarray | None = None,
     *,
     max_each: int = 16,
 ) -> tuple[list[PieceBlob], list[PieceBlob]]:
-    """Strict white/black piece blobs (up to a full chess side each by default)."""
+    """Wood-on-table piece blobs via local morph contrast (tophat / blackhat)."""
     work, offset = _crop_roi(frame_bgr, search_roi)
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Background without small pieces (kernel ≫ piece). Better than medianBlur which
-    # gets pulled toward the piece itself.
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45))
-    bg_open = cv2.morphologyEx(blur, cv2.MORPH_OPEN, k)  # drops bright blobs
-    bg_close = cv2.morphologyEx(blur, cv2.MORPH_CLOSE, k)  # fills dark blobs
-    white_mask = (
-        (blur.astype(np.int16) - bg_open.astype(np.int16) >= 35) & (blur >= 150)
-    ).astype(np.uint8) * 255
-    black_mask = (
-        (bg_close.astype(np.int16) - blur.astype(np.int16) >= 35) & (blur <= 90)
-    ).astype(np.uint8) * 255
-    kernel = np.ones((5, 5), np.uint8)
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
-    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel)
+    surface = _table_surface_mask(work)
+    if search_roi is not None:
+        # Cal board ROI crop: trust the crop, don't require green-table mask.
+        surface = np.full(gray.shape, 255, dtype=np.uint8)
+
+    # Kernel must exceed piece diameter so the blob center stays a peak (not hollow).
+    hat_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45))
+    tophat = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, hat_k)
+    blackhat = cv2.morphologyEx(blur, cv2.MORPH_BLACKHAT, hat_k)
 
     h, w = gray.shape[:2]
     roi_area = float(h * w)
-    min_a = max(120.0, roi_area * 0.00035)
-    max_a = min(12000.0, roi_area * 0.04)
-    # ~half a typical piece diameter — stops double-hits on the same blob
-    min_sep = max(28.0, (min_a**0.5) * 1.6)
+    # Wood tops are small local peaks; allow a wide area band for filled synthetics too.
+    min_a = max(40.0, roi_area * 0.00005)
+    max_a = min(2500.0, roi_area * 0.02)
+    min_sep = max(26.0, (min_a**0.5) * 1.5)
 
     whites = _nms_blobs(
-        _piece_candidates(gray, white_mask, want_bright=True, min_area=min_a, max_area=max_a),
+        _blobs_from_response(
+            work, blur, tophat, surface, thr=12, want_bright=True, min_area=min_a, max_area=max_a
+        ),
         max_each,
         min_sep,
     )
     blacks = _nms_blobs(
-        _piece_candidates(gray, black_mask, want_bright=False, min_area=min_a, max_area=max_a),
+        _blobs_from_response(
+            work, blur, blackhat, surface, thr=24, want_bright=False, min_area=min_a, max_area=max_a
+        ),
         max_each,
         min_sep,
     )
@@ -245,14 +278,15 @@ def setup_from_corner_pieces(
     White on the near (bottom) side of the board ⇒ bot is white.
     If a black piece is also visible on the opposite corner, use both for size/pose.
     """
-    pair = detect_white_black_pieces(frame_bgr, search_roi=search_roi)
+    roi = search_roi if search_roi is not None else existing_board
+    pair = detect_white_black_pieces(frame_bgr, search_roi=roi)
     white_xy: tuple[float, float] | None
     black_xy: tuple[float, float] | None
     if pair is not None:
         white_xy, black_xy = pair
         board = board_quad_from_opposite_corners(white_xy, black_xy)
     else:
-        white_xy = detect_white_piece(frame_bgr, search_roi=search_roi)
+        white_xy = detect_white_piece(frame_bgr, search_roi=roi)
         black_xy = None
         if white_xy is None:
             return None
