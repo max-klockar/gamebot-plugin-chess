@@ -116,13 +116,25 @@ def _piece_candidates(
     return out
 
 
+def _nms_blobs(blobs: list[PieceBlob], max_keep: int, min_dist: float) -> list[PieceBlob]:
+    """Keep highest-score blobs that are spatially separated (one per piece)."""
+    kept: list[PieceBlob] = []
+    for b in blobs:
+        if len(kept) >= max_keep:
+            break
+        if any(float(np.linalg.norm(np.array(b.xy) - np.array(k.xy))) < min_dist for k in kept):
+            continue
+        kept.append(b)
+    return kept
+
+
 def find_piece_blobs(
     frame_bgr: np.ndarray,
     search_roi: np.ndarray | None = None,
     *,
-    max_each: int = 1,
+    max_each: int = 16,
 ) -> tuple[list[PieceBlob], list[PieceBlob]]:
-    """Strict white/black piece blobs (default: best one of each)."""
+    """Strict white/black piece blobs (up to a full chess side each by default)."""
     work, offset = _crop_roi(frame_bgr, search_roi)
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -145,14 +157,24 @@ def find_piece_blobs(
     roi_area = float(h * w)
     min_a = max(120.0, roi_area * 0.00035)
     max_a = min(12000.0, roi_area * 0.04)
+    # ~half a typical piece diameter — stops double-hits on the same blob
+    min_sep = max(28.0, (min_a**0.5) * 1.6)
 
-    whites = _piece_candidates(gray, white_mask, want_bright=True, min_area=min_a, max_area=max_a)
-    blacks = _piece_candidates(gray, black_mask, want_bright=False, min_area=min_a, max_area=max_a)
+    whites = _nms_blobs(
+        _piece_candidates(gray, white_mask, want_bright=True, min_area=min_a, max_area=max_a),
+        max_each,
+        min_sep,
+    )
+    blacks = _nms_blobs(
+        _piece_candidates(gray, black_mask, want_bright=False, min_area=min_a, max_area=max_a),
+        max_each,
+        min_sep,
+    )
 
     def shift(blobs: list[PieceBlob]) -> list[PieceBlob]:
         return [
             PieceBlob((b.xy[0] + offset[0], b.xy[1] + offset[1]), b.area, b.score, b.mean_gray)
-            for b in blobs[:max_each]
+            for b in blobs
         ]
 
     return shift(whites), shift(blacks)
