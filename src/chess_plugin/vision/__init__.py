@@ -33,27 +33,129 @@ class CornerPieceSetup:
     bot_is_white: bool
 
 
-def _largest_blob(
+@dataclass
+class PieceBlob:
+    xy: tuple[float, float]
+    area: float
+    score: float
+    mean_gray: float
+
+
+def _crop_roi(
+    frame_bgr: np.ndarray,
+    search_roi: np.ndarray | None,
+    pad: int = 24,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (crop, offset_xy)."""
+    if search_roi is None or len(search_roi) < 4:
+        return frame_bgr, np.array([0.0, 0.0])
+    xs, ys = search_roi[:, 0], search_roi[:, 1]
+    x0 = max(0, int(xs.min()) - pad)
+    y0 = max(0, int(ys.min()) - pad)
+    x1 = min(frame_bgr.shape[1], int(xs.max()) + pad)
+    y1 = min(frame_bgr.shape[0], int(ys.max()) + pad)
+    if x1 - x0 < 40 or y1 - y0 < 40:
+        return frame_bgr, np.array([0.0, 0.0])
+    return frame_bgr[y0:y1, x0:x1], np.array([float(x0), float(y0)])
+
+
+def _piece_candidates(
+    gray: np.ndarray,
     mask: np.ndarray,
     *,
-    min_area: float = 80.0,
-    max_area: float = 25000.0,
-) -> tuple[tuple[float, float], float] | None:
+    want_bright: bool,
+    min_area: float,
+    max_area: float,
+    edge_margin: int = 8,
+) -> list[PieceBlob]:
+    """Compact round blobs only — rejects glare strips and shadow puddles."""
+    h, w = gray.shape[:2]
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best_xy: tuple[float, float] | None = None
-    best_area = min_area
+    out: list[PieceBlob] = []
     for cnt in contours:
         area = float(cv2.contourArea(cnt))
-        if area < best_area or area > max_area:
+        if area < min_area or area > max_area:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        if peri < 1e-3:
+            continue
+        circularity = float(4.0 * np.pi * area / (peri * peri))
+        if circularity < 0.55:
+            continue
+        (_cx, _cy), (bw, bh), _ang = cv2.minAreaRect(cnt)
+        if bw < 1 or bh < 1:
+            continue
+        aspect = max(bw, bh) / min(bw, bh)
+        if aspect > 1.75:
             continue
         m = cv2.moments(cnt)
         if m["m00"] == 0:
             continue
-        best_xy = (m["m10"] / m["m00"], m["m01"] / m["m00"])
-        best_area = area
-    if best_xy is None:
-        return None
-    return best_xy, best_area
+        cx = m["m10"] / m["m00"]
+        cy = m["m01"] / m["m00"]
+        if cx < edge_margin or cy < edge_margin or cx > w - edge_margin or cy > h - edge_margin:
+            continue
+        x, y, rw, rh = cv2.boundingRect(cnt)
+        patch = gray[y : y + rh, x : x + rw]
+        if patch.size == 0:
+            continue
+        # Mean only inside the contour (bbox would dilute with background)
+        cnt_local = cnt - np.array([[x, y]])
+        local_mask = np.zeros(patch.shape, dtype=np.uint8)
+        cv2.drawContours(local_mask, [cnt_local], -1, 255, -1)
+        mean_g = float(cv2.mean(patch, mask=local_mask)[0])
+        if want_bright and mean_g < 150:
+            continue
+        if not want_bright and mean_g > 85:
+            continue
+        # Prefer round + extreme brightness
+        extreme = mean_g / 255.0 if want_bright else (1.0 - mean_g / 255.0)
+        score = circularity * extreme * min(1.0, area / 400.0)
+        out.append(PieceBlob((cx, cy), area, score, mean_g))
+    out.sort(key=lambda b: b.score, reverse=True)
+    return out
+
+
+def find_piece_blobs(
+    frame_bgr: np.ndarray,
+    search_roi: np.ndarray | None = None,
+    *,
+    max_each: int = 1,
+) -> tuple[list[PieceBlob], list[PieceBlob]]:
+    """Strict white/black piece blobs (default: best one of each)."""
+    work, offset = _crop_roi(frame_bgr, search_roi)
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Background without small pieces (kernel ≫ piece). Better than medianBlur which
+    # gets pulled toward the piece itself.
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45))
+    bg_open = cv2.morphologyEx(blur, cv2.MORPH_OPEN, k)  # drops bright blobs
+    bg_close = cv2.morphologyEx(blur, cv2.MORPH_CLOSE, k)  # fills dark blobs
+    white_mask = (
+        (blur.astype(np.int16) - bg_open.astype(np.int16) >= 35) & (blur >= 150)
+    ).astype(np.uint8) * 255
+    black_mask = (
+        (bg_close.astype(np.int16) - blur.astype(np.int16) >= 35) & (blur <= 90)
+    ).astype(np.uint8) * 255
+    kernel = np.ones((5, 5), np.uint8)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel)
+
+    h, w = gray.shape[:2]
+    roi_area = float(h * w)
+    min_a = max(120.0, roi_area * 0.00035)
+    max_a = min(12000.0, roi_area * 0.04)
+
+    whites = _piece_candidates(gray, white_mask, want_bright=True, min_area=min_a, max_area=max_a)
+    blacks = _piece_candidates(gray, black_mask, want_bright=False, min_area=min_a, max_area=max_a)
+
+    def shift(blobs: list[PieceBlob]) -> list[PieceBlob]:
+        return [
+            PieceBlob((b.xy[0] + offset[0], b.xy[1] + offset[1]), b.area, b.score, b.mean_gray)
+            for b in blobs[:max_each]
+        ]
+
+    return shift(whites), shift(blacks)
 
 
 def detect_white_black_pieces(
@@ -61,39 +163,11 @@ def detect_white_black_pieces(
     search_roi: np.ndarray | None = None,
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
     """Find one bright (white) and one dark (black) piece blob in the frame/ROI."""
-    work = frame_bgr
-    offset = np.array([0.0, 0.0])
-    if search_roi is not None and len(search_roi) >= 4:
-        # Axis-aligned crop around the ROI to ignore room clutter.
-        xs = search_roi[:, 0]
-        ys = search_roi[:, 1]
-        x0 = max(0, int(xs.min()) - 20)
-        y0 = max(0, int(ys.min()) - 20)
-        x1 = min(frame_bgr.shape[1], int(xs.max()) + 20)
-        y1 = min(frame_bgr.shape[0], int(ys.max()) + 20)
-        if x1 - x0 < 40 or y1 - y0 < 40:
-            return None
-        work = frame_bgr[y0:y1, x0:x1]
-        offset = np.array([float(x0), float(y0)])
-
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    # White piece: very bright compact blob
-    white_thr = max(170.0, float(np.percentile(blur, 92)))
-    white_mask = cv2.threshold(blur, white_thr, 255, cv2.THRESH_BINARY)[1]
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    # Black piece: very dark compact blob
-    black_thr = min(80.0, float(np.percentile(blur, 12)))
-    black_mask = cv2.threshold(blur, black_thr, 255, cv2.THRESH_BINARY_INV)[1]
-    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-
-    w = _largest_blob(white_mask)
-    b = _largest_blob(black_mask)
-    if w is None or b is None:
+    whites, blacks = find_piece_blobs(frame_bgr, search_roi, max_each=1)
+    if not whites or not blacks:
         return None
-    wxy = (w[0][0] + offset[0], w[0][1] + offset[1])
-    bxy = (b[0][0] + offset[0], b[0][1] + offset[1])
-    if float(np.linalg.norm(np.array(wxy) - np.array(bxy))) < 40.0:
+    wxy, bxy = whites[0].xy, blacks[0].xy
+    if float(np.linalg.norm(np.array(wxy) - np.array(bxy))) < 50.0:
         return None
     return wxy, bxy
 
@@ -120,31 +194,11 @@ def detect_white_piece(
     frame_bgr: np.ndarray,
     search_roi: np.ndarray | None = None,
 ) -> tuple[float, float] | None:
-    """Brightest compact blob = white piece."""
-    pair = detect_white_black_pieces(frame_bgr, search_roi=search_roi)
-    if pair is not None:
-        return pair[0]
-    # White-only path (no black required)
-    work = frame_bgr
-    offset = np.array([0.0, 0.0])
-    if search_roi is not None and len(search_roi) >= 4:
-        xs, ys = search_roi[:, 0], search_roi[:, 1]
-        x0 = max(0, int(xs.min()) - 20)
-        y0 = max(0, int(ys.min()) - 20)
-        x1 = min(frame_bgr.shape[1], int(xs.max()) + 20)
-        y1 = min(frame_bgr.shape[0], int(ys.max()) + 20)
-        if x1 - x0 >= 40 and y1 - y0 >= 40:
-            work = frame_bgr[y0:y1, x0:x1]
-            offset = np.array([float(x0), float(y0)])
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    thr = max(170.0, float(np.percentile(blur, 92)))
-    mask = cv2.threshold(blur, thr, 255, cv2.THRESH_BINARY)[1]
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    blob = _largest_blob(mask)
-    if blob is None:
+    """Best white piece blob (no black required)."""
+    whites, _blacks = find_piece_blobs(frame_bgr, search_roi, max_each=1)
+    if not whites:
         return None
-    return (blob[0][0] + offset[0], blob[0][1] + offset[1])
+    return whites[0].xy
 
 
 def snap_board_to_white_corner(
