@@ -18,10 +18,10 @@ from chess_plugin.ui import (
 from chess_plugin.vision import (
     BoardOccupancyDetector,
     detect_human_is_white,
-    hypothesize_moves,
+    hypothesize_moves_from_diff,
     occupancy_from_board,
-    occupancy_mismatch,
     setup_from_corner_pieces,
+    square_diff_energy,
     warp_board,
 )
 from gamebot.adapters.camera import MockCamera
@@ -85,10 +85,11 @@ class ChessGameSession:
             getattr(cfg, "engine_hash_mb", 64),
         )
         self.occupancy = BoardOccupancyDetector(self.layout)
-        self._prev_occ = None
+        self._prev_warped: np.ndarray | None = None
+        self._last_gray: np.ndarray | None = None
         self._waiting_engine = False
-        self._awaiting_sync = False
-        self._sync_stable = 0
+        self._awaiting_settle = False
+        self._settle_frames = 0
         self._pending_uci: str | None = None
         self._pending_count = 0
         self._dbg_tick = 0
@@ -128,8 +129,15 @@ class ChessGameSession:
         self.occupancy.set_empty_reference_from_warped(warped)
         print("occupancy: empty-square reference captured (board ROI only)")
 
+    def _snapshot_board_gray(self, frame_bgr: np.ndarray) -> np.ndarray | None:
+        cal = self._calibration
+        if cal is None:
+            return None
+        warped = warp_board(frame_bgr, cal.board_corners_camera, out_size=400)
+        return cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+
     def _resolve_setup_from_camera(self) -> bool:
-        """Prefer 2 corner pieces (white+black) for board pose + colour; else army brightness."""
+        """One white corner piece ⇒ colour (+ snap board). Optional black for full pose."""
         cal = self._calibration
         cam = self._camera
         if cal is None or cam is None:
@@ -140,37 +148,38 @@ class ChessGameSession:
         for _ in range(3):
             frame = cam.read()
 
-        # 1) Two pieces on opposite corners → board size/pose + which side is white
         roi = cal.board_corners_camera
-        setup = setup_from_corner_pieces(frame, search_roi=roi)
+        setup = setup_from_corner_pieces(frame, search_roi=roi, existing_board=roi)
         if setup is None:
-            # Widen search to full frame once (pieces may be outside old cal quad)
-            setup = setup_from_corner_pieces(frame, search_roi=None)
+            setup = setup_from_corner_pieces(frame, search_roi=None, existing_board=roi)
         if setup is not None:
             self._apply_board_corners(setup.board_corners_px)
             self.session.human_is_white = setup.human_is_white
+            black_s = (
+                f" black@({setup.black_xy[0]:.0f},{setup.black_xy[1]:.0f})"
+                if setup.black_xy is not None
+                else " (white corner only)"
+            )
             print(
-                f"corner pieces: white@({setup.white_xy[0]:.0f},{setup.white_xy[1]:.0f}) "
-                f"black@({setup.black_xy[0]:.0f},{setup.black_xy[1]:.0f}) → "
-                f"bot={'white' if setup.bot_is_white else 'black'} "
+                f"corner piece: white@({setup.white_xy[0]:.0f},{setup.white_xy[1]:.0f})"
+                f"{black_s} → bot={'white' if setup.bot_is_white else 'black'} "
                 f"you={'white' if setup.human_is_white else 'black'}"
             )
             self._capture_empty_reference(frame)
+            self._prev_warped = self._snapshot_board_gray(frame)
             return setup.human_is_white
 
-        # 2) Fallback: brightness of armies on near vs far ranks
         found = detect_human_is_white(frame, cal.board_corners_camera)
         if found is None:
             print("setup: inconclusive — assuming human=white")
             self.session.human_is_white = True
             self._capture_empty_reference(frame)
+            self._prev_warped = self._snapshot_board_gray(frame)
             return True
         self.session.human_is_white = found
-        print(
-            f"side detect: human_is_white={found} "
-            f"(near=bot side; lighter-on-near → bot white)"
-        )
+        print(f"side detect: human_is_white={found}")
         self._capture_empty_reference(frame)
+        self._prev_warped = self._snapshot_board_gray(frame)
         return found
 
     def on_enter(self) -> None:
@@ -189,14 +198,10 @@ class ChessGameSession:
                 f"(you={side}, bot={bot_side})"
             )
             self.session.quick_start(guest, band, level, human_is_white=human_white)
-            # If bot moves first, do NOT block on camera sync or the arrow never appears.
-            if human_white:
-                self._awaiting_sync = True
-                self._sync_stable = 0
-                self._prev_occ = None
-            else:
-                self._awaiting_sync = False
-                self._prev_occ = None
+            self._awaiting_settle = False
+            self._settle_frames = 0
+            self._pending_uci = None
+            self._pending_count = 0
             return
         self.session.phase = Phase.PROFILE
 
@@ -254,15 +259,16 @@ class ChessGameSession:
         if zone_id.startswith("level:"):
             self._resolve_setup_from_camera()
             s.select_skill_level(int(zone_id.split(":", 1)[1]))
-            self._awaiting_sync = True
-            self._sync_stable = 0
-            self._prev_occ = None
+            self._awaiting_settle = False
+            self._pending_uci = None
+            self._pending_count = 0
             return
         if zone_id.startswith("promo:"):
             s.confirm_promotion(int(zone_id.split(":", 1)[1]))
-            self._awaiting_sync = True
-            self._sync_stable = 0
-            self._prev_occ = None
+            self._awaiting_settle = True
+            self._settle_frames = 0
+            self._pending_uci = None
+            self._pending_count = 0
             return
         if zone_id == "again":
             s.phase = Phase.PROFILE
@@ -282,9 +288,9 @@ class ChessGameSession:
         s = self.session
         if s.phase != Phase.PLAY:
             return
-        if self._awaiting_sync or s.is_human_turn():
+        if self._awaiting_settle or s.is_human_turn():
             self._poll_board_move(frame_bgr)
-        if not s.is_human_turn() and not self._waiting_engine and not self._awaiting_sync:
+        if not s.is_human_turn() and not self._waiting_engine and not self._awaiting_settle:
             self._waiting_engine = True
             self._do_engine_turn()
             self._waiting_engine = False
@@ -307,10 +313,9 @@ class ChessGameSession:
             cam = self._camera
             if isinstance(cam, MockCamera):
                 cam.set_occupancy(occupancy_from_board(s.board))
-            # Wait until the physical board matches software (bot piece placed).
-            self._awaiting_sync = True
-            self._sync_stable = 0
-            self._prev_occ = None
+            # Wait for hand motion to settle after placing the bot piece (no ideal occupancy sync).
+            self._awaiting_settle = True
+            self._settle_frames = 0
             self._pending_uci = None
             self._pending_count = 0
         except Exception as exc:  # noqa: BLE001 — keep session alive
@@ -331,83 +336,83 @@ class ChessGameSession:
         cam = self._camera
         if isinstance(cam, MockCamera):
             cam.set_occupancy(occupancy_from_board(s.board))
-        self._awaiting_sync = True
-        self._sync_stable = 0
-        self._prev_occ = None
+        self._awaiting_settle = True
+        self._settle_frames = 0
 
     def _poll_board_move(self, frame_bgr: np.ndarray) -> None:
+        """Watch only the warped board ROI; detect moves via frame diff vs legal moves."""
         s = self.session
         cal = self._calibration
         if cal is None or s.phase != Phase.PLAY:
             return
-        result = self.occupancy.detect(frame_bgr, cal.board_corners_camera)
-        expected = occupancy_from_board(s.board)
-        mismatch = occupancy_mismatch(result.grid, expected)
+        gray = self._snapshot_board_gray(frame_bgr)
+        if gray is None:
+            return
         self._dbg_tick += 1
 
-        # After engine: wait until pieces roughly match (or give up and watch deltas).
-        if self._awaiting_sync:
-            # Occupancy is imperfect on blue boards — allow a loose match, then timeout.
-            if mismatch <= 8:
-                self._sync_stable += 1
+        if self._last_gray is None or self._prev_warped is None:
+            self._last_gray = gray
+            self._prev_warped = gray.copy()
+            return
+
+        frame_motion = float(np.mean(cv2.absdiff(self._last_gray, gray)))
+        self._last_gray = gray
+
+        # After engine arrow: wait until the hand stops moving, then lock a new baseline.
+        if self._awaiting_settle:
+            if frame_motion > 4.0:
+                self._settle_frames = 0
             else:
-                self._sync_stable = 0
-            if self._dbg_tick % 45 == 0:
-                print(
-                    f"waiting for board sync… mismatch={mismatch}/64 "
-                    f"(place the blue-arrow piece, then your move)"
-                )
-            timed_out = self._dbg_tick > 0 and self._sync_stable == 0 and self._dbg_tick % 200 == 0
-            if self._sync_stable >= 5 or timed_out:
-                self._awaiting_sync = False
-                self._prev_occ = result.grid.copy()
+                self._settle_frames += 1
+            if self._dbg_tick % 40 == 0:
+                print(f"waiting for board to settle… motion={frame_motion:.1f}")
+            if self._settle_frames >= 10:
+                self._awaiting_settle = False
+                self._prev_warped = gray.copy()
                 self._pending_uci = None
                 self._pending_count = 0
-                if timed_out:
-                    print("board sync timed out — watching for your move anyway")
-                else:
-                    print("board synced — your move" if s.is_human_turn() else "board synced")
+                print("board settled — your move" if s.is_human_turn() else "board settled")
             return
 
         if not s.is_human_turn():
             return
-        if self._prev_occ is None:
-            self._prev_occ = result.grid.copy()
-            return
 
-        # Hand over board → too many squares flip; ignore.
-        changed = occupancy_mismatch(self._prev_occ, result.grid)
-        if changed > 4:
-            if self._dbg_tick % 30 == 0:
-                print(f"move watch: noisy delta={changed} (hand?) — ignoring")
+        # Hand still moving — don't commit a move yet.
+        if frame_motion > 5.0:
             self._pending_uci = None
             self._pending_count = 0
             return
 
-        hyps = hypothesize_moves(self._prev_occ, result.grid, s.board)
+        energy = square_diff_energy(self._prev_warped, gray)
+        hyps = hypothesize_moves_from_diff(energy, s.board, min_square=8.0)
         if not hyps:
-            if changed > 0 and self._dbg_tick % 30 == 0:
-                print(f"move watch: delta={changed} but no legal match yet")
-            self._pending_uci = None
-            self._pending_count = 0
             return
-        if len(hyps) > 1 and hyps[0].score - hyps[1].score < 0.05:
+        best = hyps[0]
+        second = hyps[1].score if len(hyps) > 1 else 0.0
+        if best.score < 22.0:
+            return
+        if second > 0 and best.score < second * 1.25:
+            if self._dbg_tick % 30 == 0:
+                print(
+                    f"move watch: ambiguous {best.move.uci()} ({best.score:.0f}) "
+                    f"vs {hyps[1].move.uci()} ({second:.0f})"
+                )
             return
 
-        uci = hyps[0].move.uci()
+        uci = best.move.uci()
         if uci == self._pending_uci:
             self._pending_count += 1
         else:
             self._pending_uci = uci
             self._pending_count = 1
-        if self._pending_count < 4:
+            print(f"move watch: candidate {uci} score={best.score:.0f}")
+        if self._pending_count < 5:
             return
-        if s.try_human_move(hyps[0].move):
+        if s.try_human_move(best.move):
             print(f"human move detected: {uci}")
-            self._prev_occ = result.grid.copy()
+            self._prev_warped = gray.copy()
             self._pending_uci = None
             self._pending_count = 0
-            # Next engine move will set awaiting_sync again.
 
 
 class ChessPlugin:

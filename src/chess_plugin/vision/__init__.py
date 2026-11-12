@@ -24,10 +24,10 @@ class MoveHypothesis:
 
 @dataclass
 class CornerPieceSetup:
-    """White + black pieces on opposite board corners define pose + colour."""
+    """White corner piece defines colour; optional black for opposite-corner pose."""
 
     white_xy: tuple[float, float]
-    black_xy: tuple[float, float]
+    black_xy: tuple[float, float] | None
     board_corners_px: np.ndarray  # TL,TR,BR,BL
     human_is_white: bool
     bot_is_white: bool
@@ -116,27 +116,78 @@ def board_quad_from_opposite_corners(
     return np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float64)
 
 
+def detect_white_piece(
+    frame_bgr: np.ndarray,
+    search_roi: np.ndarray | None = None,
+) -> tuple[float, float] | None:
+    """Brightest compact blob = white piece."""
+    pair = detect_white_black_pieces(frame_bgr, search_roi=search_roi)
+    if pair is not None:
+        return pair[0]
+    # White-only path (no black required)
+    work = frame_bgr
+    offset = np.array([0.0, 0.0])
+    if search_roi is not None and len(search_roi) >= 4:
+        xs, ys = search_roi[:, 0], search_roi[:, 1]
+        x0 = max(0, int(xs.min()) - 20)
+        y0 = max(0, int(ys.min()) - 20)
+        x1 = min(frame_bgr.shape[1], int(xs.max()) + 20)
+        y1 = min(frame_bgr.shape[0], int(ys.max()) + 20)
+        if x1 - x0 >= 40 and y1 - y0 >= 40:
+            work = frame_bgr[y0:y1, x0:x1]
+            offset = np.array([float(x0), float(y0)])
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    thr = max(170.0, float(np.percentile(blur, 92)))
+    mask = cv2.threshold(blur, thr, 255, cv2.THRESH_BINARY)[1]
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    blob = _largest_blob(mask)
+    if blob is None:
+        return None
+    return (blob[0][0] + offset[0], blob[0][1] + offset[1])
+
+
+def snap_board_to_white_corner(
+    white_xy: tuple[float, float],
+    board_corners_px: np.ndarray,
+) -> np.ndarray:
+    """Translate existing board quad so the nearest corner sits on the white piece."""
+    board = np.asarray(board_corners_px, dtype=np.float64).reshape(4, 2)
+    white = np.asarray(white_xy, dtype=np.float64)
+    dists = np.linalg.norm(board - white, axis=1)
+    i = int(np.argmin(dists))
+    return board + (white - board[i])
+
+
 def setup_from_corner_pieces(
     frame_bgr: np.ndarray,
     search_roi: np.ndarray | None = None,
+    existing_board: np.ndarray | None = None,
 ) -> CornerPieceSetup | None:
-    """Use one white + one black piece on opposite corners to set board + colour.
+    """One white corner piece is enough for colour (+ optional snap of board pose).
 
-    Rule: white piece on the near (bottom) half of the board quad ⇒ bot is white
-    (near = machine/bot side of the table).
+    White on the near (bottom) side of the board ⇒ bot is white.
+    If a black piece is also visible on the opposite corner, use both for size/pose.
     """
-    found = detect_white_black_pieces(frame_bgr, search_roi=search_roi)
-    if found is None:
-        return None
-    white_xy, black_xy = found
-    board = board_quad_from_opposite_corners(white_xy, black_xy)
-    # Near side = bottom edge midpoint of ordered quad
+    pair = detect_white_black_pieces(frame_bgr, search_roi=search_roi)
+    white_xy: tuple[float, float] | None
+    black_xy: tuple[float, float] | None
+    if pair is not None:
+        white_xy, black_xy = pair
+        board = board_quad_from_opposite_corners(white_xy, black_xy)
+    else:
+        white_xy = detect_white_piece(frame_bgr, search_roi=search_roi)
+        black_xy = None
+        if white_xy is None:
+            return None
+        if existing_board is None:
+            return None
+        board = snap_board_to_white_corner(white_xy, existing_board)
+
     near_mid = 0.5 * (board[2] + board[3])
     far_mid = 0.5 * (board[0] + board[1])
     white = np.asarray(white_xy, dtype=np.float64)
-    dist_near = float(np.linalg.norm(white - near_mid))
-    dist_far = float(np.linalg.norm(white - far_mid))
-    bot_is_white = dist_near <= dist_far
+    bot_is_white = float(np.linalg.norm(white - near_mid)) <= float(np.linalg.norm(white - far_mid))
     return CornerPieceSetup(
         white_xy=white_xy,
         black_xy=black_xy,
@@ -144,6 +195,46 @@ def setup_from_corner_pieces(
         human_is_white=not bot_is_white,
         bot_is_white=bot_is_white,
     )
+
+
+def square_diff_energy(prev_gray: np.ndarray, curr_gray: np.ndarray, inset_frac: float = 0.22) -> np.ndarray:
+    """Per-square mean abs-diff inside the warped board (8x8)."""
+    diff = cv2.absdiff(prev_gray, curr_gray).astype(np.float32)
+    h = diff.shape[0]
+    sq = h // 8
+    inset = max(6, int(sq * inset_frac))
+    energy = np.zeros((8, 8), dtype=np.float64)
+    for r in range(8):
+        for c in range(8):
+            patch = diff[r * sq + inset : (r + 1) * sq - inset, c * sq + inset : (c + 1) * sq - inset]
+            energy[r, c] = float(patch.mean()) if patch.size else 0.0
+    return energy
+
+
+def hypothesize_moves_from_diff(
+    energy: np.ndarray,
+    board: chess.Board,
+    *,
+    min_square: float = 10.0,
+) -> list[MoveHypothesis]:
+    """Score legal moves by how much their from/to squares changed in the board ROI."""
+
+    def idx(sq: chess.Square) -> tuple[int, int]:
+        return 7 - chess.square_rank(sq), chess.square_file(sq)
+
+    scored: list[MoveHypothesis] = []
+    for m in board.legal_moves:
+        fr, fc = idx(m.from_square)
+        tr, tc = idx(m.to_square)
+        e_from = float(energy[fr, fc])
+        e_to = float(energy[tr, tc])
+        if e_from < min_square and e_to < min_square:
+            continue
+        # Both ends should change for a normal move; captures still light up both.
+        score = e_from + e_to
+        scored.append(MoveHypothesis(m, score))
+    scored.sort(key=lambda h: h.score, reverse=True)
+    return scored
 
 
 class BoardOccupancyDetector:
