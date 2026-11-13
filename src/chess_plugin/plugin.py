@@ -26,7 +26,7 @@ from chess_plugin.vision import (
 )
 from gamebot.adapters.camera import MockCamera
 from gamebot.calibration import estimate_homography
-from gamebot.geometry import TableLayout
+from gamebot.geometry import TableLayout, force_square_quad
 from gamebot.plugins.protocol import IdentifyContext, RuntimeHandles
 from gamebot.ui import Scene
 
@@ -102,6 +102,8 @@ class ChessGameSession:
         cal = self._calibration
         if cal is None:
             return
+        # Projected board must stay square (shortest edge → length & width).
+        board_cam = force_square_quad(board_cam)
         table = self.layout.board_corners()
         H_t2c = estimate_homography(table, board_cam)
         if H_t2c is None:

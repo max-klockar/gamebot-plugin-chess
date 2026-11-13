@@ -6,7 +6,7 @@ import chess
 import cv2
 import numpy as np
 
-from gamebot.geometry import TableLayout
+from gamebot.geometry import TableLayout, force_square_quad
 
 
 @dataclass
@@ -231,7 +231,11 @@ def board_quad_from_opposite_corners(
     a: tuple[float, float],
     b: tuple[float, float],
 ) -> np.ndarray:
-    """Square board outer quad (TL,TR,BR,BL) from two opposite corner points."""
+    """Square board outer quad (TL,TR,BR,BL) from two opposite corner points.
+
+    Builds a square on the diagonal a–b (equal sides), then re-asserts the
+    shortest-edge square so length/width cannot drift apart.
+    """
     a_xy = np.asarray(a, dtype=np.float64)
     b_xy = np.asarray(b, dtype=np.float64)
     mid = 0.5 * (a_xy + b_xy)
@@ -242,7 +246,8 @@ def board_quad_from_opposite_corners(
     by_y = corners[np.argsort(corners[:, 1])]
     top = by_y[:2][np.argsort(by_y[:2, 0])]
     bot = by_y[2:][np.argsort(by_y[2:, 0])]
-    return np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float64)
+    ordered = np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float64)
+    return force_square_quad(ordered)
 
 
 def detect_white_piece(
@@ -292,7 +297,7 @@ def setup_from_corner_pieces(
             return None
         if existing_board is None:
             return None
-        board = snap_board_to_white_corner(white_xy, existing_board)
+        board = force_square_quad(snap_board_to_white_corner(white_xy, existing_board))
 
     near_mid = 0.5 * (board[2] + board[3])
     far_mid = 0.5 * (board[0] + board[1])
