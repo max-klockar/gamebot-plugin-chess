@@ -238,6 +238,8 @@ class ChessGameSession:
         if s.last_engine_promotion:
             promo_label = chess.piece_symbol(s.last_engine_promotion).upper()
         scene = build_play_overlay(layout, s.last_engine_move, checks, revert, promo_label)
+        # No projected chess grid during play — piece/move vision trains on blackproj.
+        scene.project_chessboard = False
         if s.is_human_turn():
             scene.add_text("Your move", layout.margin_mm, layout.margin_mm - 28, (220, 220, 80))
         else:
