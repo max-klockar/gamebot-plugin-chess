@@ -101,11 +101,17 @@ class ChessGameSession:
         self._setup_lock_every = 45
         self._setup_tick = 0
 
-    def _apply_board_corners(self, board_cam: np.ndarray, *, force_square: bool = True) -> None:
-        """Update calibration so table↔camera↔projector match the board quad.
+    def _apply_board_corners(
+        self,
+        board_cam: np.ndarray,
+        *,
+        force_square: bool = True,
+        update_projector: bool = True,
+    ) -> None:
+        """Update table↔camera (+ optional projector) from a board quad.
 
-        `force_square=True` for projected / corner-piece setup (keep overlays square).
-        Physical YOLO+mech quads must stay trapezoid (`force_square=False`).
+        During WAIT_SETUP use update_projector=False so the projected border stays
+        on the colour-cal pose (nudge wood under it; outline must not chase).
         """
         cal = self._calibration
         if cal is None:
@@ -117,14 +123,14 @@ class ChessGameSession:
         H_t2c = estimate_homography(table, board_cam)
         if H_t2c is None:
             return
-        H_t2p = cal.H_camera_to_projector @ H_t2c
         cal.board_corners_camera = board_cam
         cal.H_table_to_camera = H_t2c
-        cal.H_table_to_projector = H_t2p
-        # Host renderer follows projector H when present
-        renderer = getattr(self.runtime, "renderer", None)
-        if renderer is not None and hasattr(renderer, "set_homography"):
-            renderer.set_homography(H_t2p)
+        if update_projector:
+            H_t2p = cal.H_camera_to_projector @ H_t2c
+            cal.H_table_to_projector = H_t2p
+            renderer = getattr(self.runtime, "renderer", None)
+            if renderer is not None and hasattr(renderer, "set_homography"):
+                renderer.set_homography(H_t2p)
         path = getattr(self.runtime.config, "calibration_path", None)
         if path is not None:
             try:
@@ -147,7 +153,12 @@ class ChessGameSession:
         warped = warp_board(frame_bgr, cal.board_corners_camera, out_size=400)
         return cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
-    def _lock_physical_board(self, frame_bgr: np.ndarray) -> np.ndarray | None:
+    def _lock_physical_board(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        update_projector: bool = True,
+    ) -> np.ndarray | None:
         """YOLO AABB + classical corner refine → playing-field quad in camera px."""
         try:
             from gamebot.board_detect import detect_physical_board_quad
@@ -162,8 +173,12 @@ class ChessGameSession:
         if result is None:
             print("board lock: no board found")
             return None
-        self._apply_board_corners(result.quad, force_square=False)
-        print(f"board lock: {result.method}")
+        self._apply_board_corners(
+            result.quad, force_square=False, update_projector=update_projector
+        )
+        if getattr(self, "_last_lock_method", None) != result.method:
+            print(f"board lock: {result.method}")
+            self._last_lock_method = result.method
         return result.quad
 
     def _resolve_setup_from_camera(self) -> bool:
@@ -253,6 +268,7 @@ class ChessGameSession:
         if s.phase == Phase.WAIT_SETUP:
             sc = Scene(layout)
             sc.project_chessboard = False
+            sc.project_board_border = True  # align physical board to projected outline
             sc.title = "Set up pieces"
             sc.add_text(
                 "Starting position → game starts",
@@ -277,8 +293,9 @@ class ChessGameSession:
         if s.last_engine_promotion:
             promo_label = chess.piece_symbol(s.last_engine_promotion).upper()
         scene = build_play_overlay(layout, s.last_engine_move, checks, revert, promo_label)
-        # No projected chess grid during play — piece/move vision trains on blackproj.
+        # No filled chess grid during play (blackproj vision); keep outline for alignment.
         scene.project_chessboard = False
+        scene.project_board_border = True
         if s.is_human_turn():
             scene.add_text("Your move", layout.margin_mm, layout.margin_mm - 28, (220, 220, 80))
         else:
@@ -350,7 +367,8 @@ class ChessGameSession:
             return
         self._setup_tick += 1
         if self._setup_tick == 1 or self._setup_tick % self._setup_lock_every == 0:
-            self._lock_physical_board(frame_bgr)
+            # Camera lock only — projected border stays on colour-cal so you can align wood.
+            self._lock_physical_board(frame_bgr, update_projector=False)
 
         occ = self.occupancy.detect(frame_bgr, cal.board_corners_camera)
         if looks_like_starting_occupancy(occ.grid):
@@ -365,6 +383,8 @@ class ChessGameSession:
             return
 
         human_white = self._resolve_setup_from_camera()
+        # Now snap projector overlays onto the locked physical board for play.
+        self._lock_physical_board(frame_bgr, update_projector=True)
         side = "white" if human_white else "black"
         print(f"setup ready — you={side}; starting game")
         self.session.confirm_setup(human_is_white=human_white)
