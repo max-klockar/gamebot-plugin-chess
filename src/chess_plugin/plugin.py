@@ -104,6 +104,21 @@ class ChessGameSession:
         self._last_good_quad: np.ndarray | None = None
         self._last_good_method: str | None = None
         self._lock_misses = 0
+        self._lock_pending_quad: np.ndarray | None = None
+        self._lock_pending_count = 0
+        self._lock_frozen = False
+
+    def _seed_lock_from_calibration(self) -> None:
+        """Paint magenta border from cal once — board does not move; stop chasing vision."""
+        cal = self._calibration
+        if cal is None or cal.board_corners_camera is None:
+            return
+        self._apply_board_corners(
+            cal.board_corners_camera, force_square=False, update_projector=True, persist=False
+        )
+        self._last_good_quad = np.asarray(cal.board_corners_camera, dtype=np.float64).reshape(4, 2).copy()
+        self._lock_frozen = True
+        print("board lock: seeded from calibration (frozen until sustained jump)")
 
     def _apply_board_corners(
         self,
@@ -111,11 +126,13 @@ class ChessGameSession:
         *,
         force_square: bool = True,
         update_projector: bool = True,
+        persist: bool = False,
     ) -> None:
         """Update table↔camera (+ optional projector) from a board quad.
 
         Projector pose is fit so table board corners land on H_c2p(vision corners),
         and the same projector quad is kept for a direct pixel outline.
+        Does not rewrite cal on disk unless ``persist`` (avoids hand-wave “recal”).
         """
         cal = self._calibration
         if cal is None:
@@ -141,9 +158,8 @@ class ChessGameSession:
                 renderer.set_homography(H_t2p)
             else:
                 print("board lock: renderer missing — border may not move")
-            # Debug (throttled): colour-cal default quad is ~scale 0.32 (~230px on 720p).
             self._lock_dbg_i = getattr(self, "_lock_dbg_i", 0) + 1
-            if self._lock_dbg_i <= 3 or self._lock_dbg_i % 8 == 0:
+            if self._lock_dbg_i <= 2 or self._lock_dbg_i % 20 == 0:
                 cam_w = float(np.linalg.norm(board_cam[1] - board_cam[0]))
                 cam_h = float(np.linalg.norm(board_cam[3] - board_cam[0]))
                 proj_w = float(np.linalg.norm(board_proj[1] - board_proj[0]))
@@ -155,16 +171,13 @@ class ChessGameSession:
                     f"(frame {cw}x{ch})  proj_quad≈{proj_w:.0f}x{proj_h:.0f}px "
                     f"(frame {pw}x{ph})  renderer={'yes' if renderer else 'NO'}"
                 )
-                print(
-                    f"  cam={np.round(board_cam, 1).tolist()}\n"
-                    f"  proj={np.round(board_proj, 1).tolist()}"
-                )
-        path = getattr(self.runtime.config, "calibration_path", None)
-        if path is not None:
-            try:
-                cal.save(path)
-            except Exception as exc:  # noqa: BLE001
-                print(f"could not save updated board corners: {exc}")
+        if persist:
+            path = getattr(self.runtime.config, "calibration_path", None)
+            if path is not None:
+                try:
+                    cal.save(path)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"could not save updated board corners: {exc}")
 
     def _capture_empty_reference(self, frame_bgr: np.ndarray) -> None:
         cal = self._calibration
@@ -187,7 +200,11 @@ class ChessGameSession:
         *,
         update_projector: bool = True,
     ) -> np.ndarray | None:
-        """YOLO AABB + classical corner refine → playing-field quad in camera px."""
+        """YOLO AABB + classical corner refine → playing-field quad in camera px.
+
+        Once locked, ignore large jumps (hand / false chessboard) unless the new
+        quad is stable for several consecutive polls — stops magenta “recal” flaps.
+        """
         try:
             from gamebot.board_detect import detect_physical_board_quad
         except Exception as exc:  # noqa: BLE001
@@ -209,11 +226,40 @@ class ChessGameSession:
             return None
 
         self._lock_misses = 0
-        # Hold a stable chessboard lock — ignore tiny jitter jumps.
+        new_quad = np.asarray(result.quad, dtype=np.float64).reshape(4, 2)
+
         if self._last_good_quad is not None:
-            delta = float(np.mean(np.linalg.norm(result.quad - self._last_good_quad, axis=1)))
-            if delta < 6.0 and result.method == self._last_good_method:
+            delta = float(np.mean(np.linalg.norm(new_quad - self._last_good_quad, axis=1)))
+            # Tiny jitter — keep frozen pose.
+            if delta < 10.0:
+                self._lock_pending_quad = None
+                self._lock_pending_count = 0
                 return self._last_good_quad
+            # Big jump (hand, wrong AABB half-frame) — require sustained agreement.
+            if delta > 28.0 or self._lock_frozen:
+                if self._lock_pending_quad is not None:
+                    pend_d = float(
+                        np.mean(np.linalg.norm(new_quad - self._lock_pending_quad, axis=1))
+                    )
+                else:
+                    pend_d = 999.0
+                if pend_d < 12.0:
+                    self._lock_pending_count += 1
+                else:
+                    self._lock_pending_quad = new_quad.copy()
+                    self._lock_pending_count = 1
+                need = 8 if self._lock_frozen else 4
+                if self._lock_pending_count < need:
+                    if self._lock_pending_count == 1:
+                        print(
+                            f"board lock: ignoring jump Δ≈{delta:.0f}px "
+                            f"(need {need} stable frames)"
+                        )
+                    return self._last_good_quad
+                print(f"board lock: accepting sustained move Δ≈{delta:.0f}px")
+                self._lock_frozen = True
+                self._lock_pending_quad = None
+                self._lock_pending_count = 0
 
         aabb = result.aabb
         if result.method != self._last_good_method:
@@ -222,12 +268,13 @@ class ChessGameSession:
                 f"frame={frame_bgr.shape[1]}x{frame_bgr.shape[0]}"
             )
         self._apply_board_corners(
-            result.quad, force_square=False, update_projector=update_projector
+            new_quad, force_square=False, update_projector=update_projector, persist=False
         )
-        self._last_good_quad = result.quad.copy()
+        self._last_good_quad = new_quad.copy()
         self._last_good_method = result.method
         self._last_lock_method = result.method
-        return result.quad
+        self._lock_frozen = True
+        return new_quad
 
     def _resolve_setup_from_camera(self) -> bool:
         """Lock physical board (YOLO+mech), then corner-piece colour / optional pose."""
@@ -247,7 +294,10 @@ class ChessGameSession:
         if setup is None:
             setup = setup_from_corner_pieces(frame, search_roi=None, existing_board=roi)
         if setup is not None:
-            self._apply_board_corners(setup.board_corners_px)
+            # Keep sticky cal lock for geometry; only take colour/side from corners.
+            self._apply_board_corners(
+                setup.board_corners_px, force_square=False, update_projector=False, persist=False
+            )
             self.session.human_is_white = setup.human_is_white
             black_s = (
                 f" black@({setup.black_xy[0]:.0f},{setup.black_xy[1]:.0f})"
@@ -295,6 +345,10 @@ class ChessGameSession:
             self._settle_frames = 0
             self._pending_uci = None
             self._pending_count = 0
+            self._lock_frozen = False
+            self._lock_pending_quad = None
+            self._lock_pending_count = 0
+            self._seed_lock_from_calibration()
             return
         self.session.phase = Phase.PROFILE
 
@@ -378,6 +432,10 @@ class ChessGameSession:
             self._pending_uci = None
             self._pending_count = 0
             print("waiting for starting position…")
+            self._lock_frozen = False
+            self._lock_pending_quad = None
+            self._lock_pending_count = 0
+            self._seed_lock_from_calibration()
             return
         if zone_id.startswith("promo:"):
             s.confirm_promotion(int(zone_id.split(":", 1)[1]))
@@ -415,32 +473,44 @@ class ChessGameSession:
             self._waiting_engine = False
 
     def _poll_wait_setup(self, frame_bgr: np.ndarray) -> None:
-        """Board lock + wait until occupancy looks like the starting position."""
+        """Stable border from cal; wait until occupancy looks like the starting position."""
         cal = self._calibration
         if cal is None:
             return
         self._setup_tick += 1
-        if self._setup_tick == 1 or self._setup_tick % self._setup_lock_every == 0:
-            # Snap projected border onto the vision-locked playing field.
+        if self._setup_tick == 1 and self._last_good_quad is None:
+            self._seed_lock_from_calibration()
+        # Rarely re-check vision; sticky lock ignores hand-wave jumps.
+        if self._setup_tick % (self._setup_lock_every * 3) == 0:
             self._lock_physical_board(frame_bgr, update_projector=True)
 
-        occ = self.occupancy.detect(frame_bgr, cal.board_corners_camera)
+        roi = self._last_good_quad if self._last_good_quad is not None else cal.board_corners_camera
+        occ = self.occupancy.detect(frame_bgr, roi)
         if looks_like_starting_occupancy(occ.grid):
             self._setup_ready_frames += 1
-        else:
-            if self._setup_ready_frames and self._setup_tick % 30 == 0:
+            if self._setup_ready_frames == 1 or self._setup_ready_frames % 10 == 0:
                 n = int(np.count_nonzero(occ.grid))
-                print(f"setup: waiting for start position (occupied≈{n}/32)")
+                print(f"setup: start-like occupancy ({n} occupied), frames={self._setup_ready_frames}")
+        else:
+            if self._setup_tick % 45 == 0:
+                n = int(np.count_nonzero(occ.grid))
+                back = int(occ.grid[0:2].sum() + occ.grid[6:8].sum())
+                mid = int(occ.grid[2:6].sum())
+                print(f"setup: waiting (occupied≈{n}, backranks≈{back}, mid≈{mid})")
             self._setup_ready_frames = 0
             return
-        if self._setup_ready_frames < 20:
+        if self._setup_ready_frames < 12:
             return
 
         human_white = self._resolve_setup_from_camera()
-        self._lock_physical_board(frame_bgr, update_projector=True)
         side = "white" if human_white else "black"
         print(f"setup ready — you={side}; starting game")
         self.session.confirm_setup(human_is_white=human_white)
+        # Persist corners once when the game actually starts.
+        if self._last_good_quad is not None:
+            self._apply_board_corners(
+                self._last_good_quad, force_square=False, update_projector=True, persist=True
+            )
         self._awaiting_settle = False
         self._settle_frames = 0
         self._pending_uci = None
