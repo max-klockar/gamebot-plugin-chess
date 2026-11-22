@@ -392,6 +392,28 @@ class BoardOccupancyDetector:
                 ref[r, c] = light_m if (r + c) % 2 == 0 else dark_m
         self.empty_reference = ref
 
+    def ensure_empty_reference(self, warped_bgr: np.ndarray) -> bool:
+        """Learn empty light/dark means from middle ranks if mid looks clear."""
+        if self.empty_reference is not None:
+            return False
+        gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+        sq = warped_bgr.shape[0] // 8
+        # Rough occupancy without a ref — middle should be mostly empty at start.
+        busy = 0
+        for r in range(2, 6):
+            for c in range(8):
+                y0, x0 = r * sq, c * sq
+                inset = max(6, sq // 6)
+                patch = gray[y0 + inset : y0 + sq - inset, x0 + inset : x0 + sq - inset]
+                if patch.size < 16:
+                    continue
+                if float(patch.std()) > 16.0 or float(cv2.Laplacian(patch, cv2.CV_64F).var()) > 80.0:
+                    busy += 1
+        if busy > 6:
+            return False
+        self.set_empty_reference_from_warped(warped_bgr)
+        return True
+
     def detect(
         self,
         frame_bgr: np.ndarray,
@@ -400,9 +422,13 @@ class BoardOccupancyDetector:
     ) -> OccupancyResult:
         """board_corners_px: 4x2 TL, TR, BR, BL in camera pixels — analysis is board-only."""
         warped = warp_board(frame_bgr, board_corners_px, out_size=400)
+        if empty_reference is None and self.empty_reference is None:
+            if self.ensure_empty_reference(warped):
+                print("occupancy: learned empty-square ref from clear middle ranks")
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blur, 50, 140)
+        # Softer Canny — small plastic pieces barely edge under projector light.
+        edges = cv2.Canny(blur, 30, 100)
         ref = empty_reference if empty_reference is not None else self.empty_reference
         grid = np.zeros((8, 8), dtype=bool)
         conf = np.zeros((8, 8), dtype=np.float64)
@@ -410,23 +436,35 @@ class BoardOccupancyDetector:
         for r in range(8):
             for c in range(8):
                 y0, x0 = r * sq, c * sq
-                # Strong inset: only the square interior (cuts border + projector lines)
-                inset = max(8, sq // 5)
+                # Milder inset — pawns near square edges were getting cropped out.
+                inset = max(5, sq // 7)
                 patch = gray[y0 + inset : y0 + sq - inset, x0 + inset : x0 + sq - inset]
                 epatch = edges[y0 + inset : y0 + sq - inset, x0 + inset : x0 + sq - inset]
+                bgr_patch = warped[y0 + inset : y0 + sq - inset, x0 + inset : x0 + sq - inset]
                 if patch.size < 16:
                     continue
                 std = float(patch.std())
                 mean = float(patch.mean())
                 edge_density = float(epatch.mean())
+                lap = float(cv2.Laplacian(patch, cv2.CV_64F).var())
+                color_std = float(bgr_patch.reshape(-1, 3).std(axis=0).mean()) if bgr_patch.size else 0.0
+                texture = max(std, lap / 8.0, color_std)
                 if ref is not None:
                     score = abs(mean - float(ref[r, c]))
-                    # Piece vs empty square: brightness shift and/or extra edges
-                    occupied = score > 18.0 or (edge_density > 9.0 and std > 10.0)
-                    conf[r, c] = min(1.0, max(score / 45.0, edge_density / 22.0))
+                    # Dark-on-dark / light-on-light: brightness score alone fails — use texture.
+                    occupied = (
+                        score > 12.0
+                        or edge_density > 5.0
+                        or texture > 11.0
+                        or lap > 55.0
+                    )
+                    conf[r, c] = min(
+                        1.0,
+                        max(score / 40.0, edge_density / 18.0, texture / 28.0, lap / 120.0),
+                    )
                 else:
-                    occupied = edge_density > 10.0 or std > 18.0
-                    conf[r, c] = min(1.0, max(edge_density / 22.0, std / 35.0))
+                    occupied = edge_density > 6.0 or texture > 12.0 or lap > 60.0
+                    conf[r, c] = min(1.0, max(edge_density / 18.0, texture / 28.0, lap / 120.0))
                 grid[r, c] = occupied
         return OccupancyResult(grid=grid, confidence=conf, warped_bgr=warped)
 
@@ -520,8 +558,7 @@ def looks_like_starting_occupancy(
 ) -> bool:
     """True if occupancy roughly matches the initial chess setup (32 pieces).
 
-    Soft fallback: both back ranks mostly full and the middle mostly empty —
-    projector edges / a few missed pawns should not block starting the game.
+    Soft fallback: both armies present on the back ranks and middle clear.
     """
     g = np.asarray(grid, dtype=bool)
     expected = occupancy_from_board(chess.Board())
@@ -529,7 +566,8 @@ def looks_like_starting_occupancy(
         return True
     back = int(g[0:2].sum() + g[6:8].sum())
     mid = int(g[2:6].sum())
-    return back >= 26 and mid <= 8
+    # ~24+ of 32 back-rank squares with empty mid is enough to start.
+    return back >= 24 and mid <= 8
 
 
 def hypothesize_moves(
