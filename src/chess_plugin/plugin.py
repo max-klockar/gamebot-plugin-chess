@@ -19,6 +19,7 @@ from chess_plugin.vision import (
     BoardOccupancyDetector,
     detect_human_is_white,
     hypothesize_moves_from_diff,
+    looks_like_starting_occupancy,
     occupancy_from_board,
     setup_from_corner_pieces,
     square_diff_energy,
@@ -96,6 +97,9 @@ class ChessGameSession:
         self._exit = False
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
+        self._setup_ready_frames = 0
+        self._setup_lock_every = 45
+        self._setup_tick = 0
 
     def _apply_board_corners(self, board_cam: np.ndarray, *, force_square: bool = True) -> None:
         """Update calibration so table↔camera↔projector match the board quad.
@@ -217,14 +221,13 @@ class ChessGameSession:
             if guest is None:
                 guest = self.db.create_profile("Guest", "beginner", 1)
             band, level = elo_to_skill(int(elo))
-            human_white = self._resolve_setup_from_camera()
-            side = "white" if human_white else "black"
-            bot_side = "black" if human_white else "white"
             print(
                 f"quick start: Guest @ ~{elo} Elo → {band.value} level {level} "
-                f"(you={side}, bot={bot_side})"
+                f"— set up the starting position to begin"
             )
-            self.session.quick_start(guest, band, level, human_is_white=human_white)
+            self.session.quick_start(guest, band, level, human_is_white=True)
+            self._setup_ready_frames = 0
+            self._setup_tick = 0
             self._awaiting_settle = False
             self._settle_frames = 0
             self._pending_uci = None
@@ -247,6 +250,17 @@ class ChessGameSession:
             return build_band_scene(layout)
         if s.phase == Phase.SKILL_LEVEL:
             return build_level_scene(layout, list(BAND_LEVEL_RANGES[s.skill_band]))
+        if s.phase == Phase.WAIT_SETUP:
+            sc = Scene(layout)
+            sc.project_chessboard = False
+            sc.title = "Set up pieces"
+            sc.add_text(
+                "Starting position → game starts",
+                layout.margin_mm,
+                layout.margin_mm + 36,
+                (220, 220, 80),
+            )
+            return sc
         if s.phase == Phase.PROMOTE:
             return build_promotion_scene(layout)
         if s.phase == Phase.GAME_OVER:
@@ -286,11 +300,13 @@ class ChessGameSession:
             s.select_skill_band(SkillBand(zone_id.split(":", 1)[1]))
             return
         if zone_id.startswith("level:"):
-            self._resolve_setup_from_camera()
             s.select_skill_level(int(zone_id.split(":", 1)[1]))
+            self._setup_ready_frames = 0
+            self._setup_tick = 0
             self._awaiting_settle = False
             self._pending_uci = None
             self._pending_count = 0
+            print("waiting for starting position…")
             return
         if zone_id.startswith("promo:"):
             s.confirm_promotion(int(zone_id.split(":", 1)[1]))
@@ -315,6 +331,9 @@ class ChessGameSession:
 
     def tick(self, frame_bgr: np.ndarray) -> None:
         s = self.session
+        if s.phase == Phase.WAIT_SETUP:
+            self._poll_wait_setup(frame_bgr)
+            return
         if s.phase != Phase.PLAY:
             return
         if self._awaiting_settle or s.is_human_turn():
@@ -323,6 +342,37 @@ class ChessGameSession:
             self._waiting_engine = True
             self._do_engine_turn()
             self._waiting_engine = False
+
+    def _poll_wait_setup(self, frame_bgr: np.ndarray) -> None:
+        """Board lock + wait until occupancy looks like the starting position."""
+        cal = self._calibration
+        if cal is None:
+            return
+        self._setup_tick += 1
+        if self._setup_tick == 1 or self._setup_tick % self._setup_lock_every == 0:
+            self._lock_physical_board(frame_bgr)
+
+        occ = self.occupancy.detect(frame_bgr, cal.board_corners_camera)
+        if looks_like_starting_occupancy(occ.grid):
+            self._setup_ready_frames += 1
+        else:
+            if self._setup_ready_frames and self._setup_tick % 30 == 0:
+                n = int(np.count_nonzero(occ.grid))
+                print(f"setup: waiting for start position (occupied≈{n}/32)")
+            self._setup_ready_frames = 0
+            return
+        if self._setup_ready_frames < 20:
+            return
+
+        human_white = self._resolve_setup_from_camera()
+        side = "white" if human_white else "black"
+        print(f"setup ready — you={side}; starting game")
+        self.session.confirm_setup(human_is_white=human_white)
+        self._awaiting_settle = False
+        self._settle_frames = 0
+        self._pending_uci = None
+        self._pending_count = 0
+        self._setup_ready_frames = 0
 
     def _do_engine_turn(self) -> None:
         s = self.session

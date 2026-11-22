@@ -80,6 +80,7 @@ class Phase(Enum):
     PROFILE = auto()
     SKILL_BAND = auto()
     SKILL_LEVEL = auto()
+    WAIT_SETUP = auto()  # physical starting position not ready yet
     PLAY = auto()
     PROMOTE = auto()
     GAME_OVER = auto()
@@ -136,7 +137,7 @@ class ChessSession:
         self.skill_level = level
         if self.profile is not None:
             self.db.update_profile_skill(self.profile.id, self.skill_band.value, level)
-        self._start_game()
+        self.phase = Phase.WAIT_SETUP
 
     def quick_start(
         self,
@@ -146,7 +147,7 @@ class ChessSession:
         *,
         human_is_white: bool = True,
     ) -> None:
-        """Skip menus — start a game at the given strength."""
+        """Skip menus — arm a game at the given strength; play after setup is confirmed."""
         self.profile = profile
         self.skill_band = band
         self.skill_level = level
@@ -156,6 +157,12 @@ class ChessSession:
             levels = list(BAND_LEVEL_RANGES[band])
             self.skill_level = min(levels, key=lambda x: abs(x - level))
         self.db.update_profile_skill(profile.id, self.skill_band.value, self.skill_level)
+        self.phase = Phase.WAIT_SETUP
+
+    def confirm_setup(self, *, human_is_white: bool | None = None) -> None:
+        """Starting position seen — enter PLAY."""
+        if human_is_white is not None:
+            self.human_is_white = human_is_white
         self._start_game()
 
     def _start_game(self) -> None:

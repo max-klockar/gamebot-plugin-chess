@@ -497,6 +497,16 @@ def occupancy_from_board(board: chess.Board) -> np.ndarray:
     return g
 
 
+def looks_like_starting_occupancy(
+    grid: np.ndarray,
+    *,
+    max_mismatch: int = 6,
+) -> bool:
+    """True if occupancy roughly matches the initial chess setup (32 pieces)."""
+    expected = occupancy_from_board(chess.Board())
+    return occupancy_mismatch(grid, expected) <= max_mismatch
+
+
 def hypothesize_moves(
     before: np.ndarray,
     after: np.ndarray,
