@@ -27,7 +27,7 @@ from chess_plugin.vision import (
 )
 from gamebot.adapters.camera import MockCamera
 from gamebot.calibration import estimate_homography
-from gamebot.geometry import TableLayout, force_square_quad
+from gamebot.geometry import TableLayout, force_square_quad, warp_points
 from gamebot.plugins.protocol import IdentifyContext, RuntimeHandles
 from gamebot.ui import Scene
 
@@ -98,8 +98,9 @@ class ChessGameSession:
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
         self._setup_ready_frames = 0
-        self._setup_lock_every = 45
+        self._setup_lock_every = 15
         self._setup_tick = 0
+        self._lock_border_proj_px: np.ndarray | None = None
 
     def _apply_board_corners(
         self,
@@ -110,7 +111,8 @@ class ChessGameSession:
     ) -> None:
         """Update table↔camera (+ optional projector) from a board quad.
 
-        When update_projector=True, projected border/overlays follow the locked board.
+        Projector pose is fit so table board corners land on H_c2p(vision corners),
+        and the same projector quad is kept for a direct pixel outline.
         """
         cal = self._calibration
         if cal is None:
@@ -125,11 +127,17 @@ class ChessGameSession:
         cal.board_corners_camera = board_cam
         cal.H_table_to_camera = H_t2c
         if update_projector:
-            H_t2p = cal.H_camera_to_projector @ H_t2c
+            board_proj = warp_points(board_cam, cal.H_camera_to_projector)
+            H_t2p = estimate_homography(table, board_proj)
+            if H_t2p is None:
+                H_t2p = cal.H_camera_to_projector @ H_t2c
             cal.H_table_to_projector = H_t2p
+            self._lock_border_proj_px = board_proj
             renderer = getattr(self.runtime, "renderer", None)
             if renderer is not None and hasattr(renderer, "set_homography"):
                 renderer.set_homography(H_t2p)
+            else:
+                print("board lock: renderer missing — border may not move")
         path = getattr(self.runtime.config, "calibration_path", None)
         if path is not None:
             try:
@@ -267,7 +275,10 @@ class ChessGameSession:
         if s.phase == Phase.WAIT_SETUP:
             sc = Scene(layout)
             sc.project_chessboard = False
-            sc.project_board_border = True  # align physical board to projected outline
+            sc.project_board_border = True  # table-H outline
+            if self._lock_border_proj_px is not None:
+                # Direct camera→projector outline (follows vision even if H drift)
+                sc.add_poly_px(self._lock_border_proj_px, (0, 255, 180), 5)
             sc.title = "Set up pieces"
             sc.add_text(
                 "Starting position → game starts",
@@ -295,6 +306,8 @@ class ChessGameSession:
         # No filled chess grid during play (blackproj vision); keep outline for alignment.
         scene.project_chessboard = False
         scene.project_board_border = True
+        if self._lock_border_proj_px is not None:
+            scene.add_poly_px(self._lock_border_proj_px, (0, 255, 180), 4)
         if s.is_human_turn():
             scene.add_text("Your move", layout.margin_mm, layout.margin_mm - 28, (220, 220, 80))
         else:
