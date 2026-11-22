@@ -110,8 +110,7 @@ class ChessGameSession:
     ) -> None:
         """Update table↔camera (+ optional projector) from a board quad.
 
-        During WAIT_SETUP use update_projector=False so the projected border stays
-        on the colour-cal pose (nudge wood under it; outline must not chase).
+        When update_projector=True, projected border/overlays follow the locked board.
         """
         cal = self._calibration
         if cal is None:
@@ -367,8 +366,8 @@ class ChessGameSession:
             return
         self._setup_tick += 1
         if self._setup_tick == 1 or self._setup_tick % self._setup_lock_every == 0:
-            # Camera lock only — projected border stays on colour-cal so you can align wood.
-            self._lock_physical_board(frame_bgr, update_projector=False)
+            # Snap projected border onto the vision-locked playing field.
+            self._lock_physical_board(frame_bgr, update_projector=True)
 
         occ = self.occupancy.detect(frame_bgr, cal.board_corners_camera)
         if looks_like_starting_occupancy(occ.grid):
@@ -383,7 +382,6 @@ class ChessGameSession:
             return
 
         human_white = self._resolve_setup_from_camera()
-        # Now snap projector overlays onto the locked physical board for play.
         self._lock_physical_board(frame_bgr, update_projector=True)
         side = "white" if human_white else "black"
         print(f"setup ready — you={side}; starting game")
