@@ -98,7 +98,7 @@ class ChessGameSession:
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
         self._setup_ready_frames = 0
-        self._setup_lock_every = 15
+        self._setup_lock_every = 5
         self._setup_tick = 0
         self._lock_border_proj_px: np.ndarray | None = None
 
@@ -296,10 +296,11 @@ class ChessGameSession:
         if s.phase == Phase.WAIT_SETUP:
             sc = Scene(layout)
             sc.project_chessboard = False
-            sc.project_board_border = True  # table-H outline
+            # Only the vision poly (magenta) — avoid drawing the old cal-H border
+            # on top, which looked like a "stuck" small square.
+            sc.project_board_border = False
             if self._lock_border_proj_px is not None:
-                # Direct camera→projector outline (follows vision even if H drift)
-                sc.add_poly_px(self._lock_border_proj_px, (0, 255, 180), 5)
+                sc.add_poly_px(self._lock_border_proj_px, (255, 0, 255), 6)
             sc.title = "Set up pieces"
             sc.add_text(
                 "Starting position → game starts",
@@ -326,9 +327,9 @@ class ChessGameSession:
         scene = build_play_overlay(layout, s.last_engine_move, checks, revert, promo_label)
         # No filled chess grid during play (blackproj vision); keep outline for alignment.
         scene.project_chessboard = False
-        scene.project_board_border = True
+        scene.project_board_border = False
         if self._lock_border_proj_px is not None:
-            scene.add_poly_px(self._lock_border_proj_px, (0, 255, 180), 4)
+            scene.add_poly_px(self._lock_border_proj_px, (255, 0, 255), 5)
         if s.is_human_turn():
             scene.add_text("Your move", layout.margin_mm, layout.margin_mm - 28, (220, 220, 80))
         else:
