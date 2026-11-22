@@ -20,6 +20,7 @@ from chess_plugin.vision import (
     detect_human_is_white,
     hypothesize_moves_from_diff,
     looks_like_starting_occupancy,
+    occupancy_debug_summary,
     occupancy_from_board,
     setup_from_corner_pieces,
     square_diff_energy,
@@ -486,17 +487,18 @@ class ChessGameSession:
 
         roi = self._last_good_quad if self._last_good_quad is not None else cal.board_corners_camera
         occ = self.occupancy.detect(frame_bgr, roi)
-        if looks_like_starting_occupancy(occ.grid):
+        ready = looks_like_starting_occupancy(occ.grid)
+        # Regular piece-count debug so we can see why setup is stuck.
+        if self._setup_tick == 1 or self._setup_tick % 20 == 0 or (ready and self._setup_ready_frames == 0):
+            print(f"setup occupancy: {occupancy_debug_summary(occ.grid)}")
+        if ready:
             self._setup_ready_frames += 1
-            if self._setup_ready_frames == 1 or self._setup_ready_frames % 10 == 0:
-                n = int(np.count_nonzero(occ.grid))
-                print(f"setup: start-like occupancy ({n} occupied), frames={self._setup_ready_frames}")
+            if self._setup_ready_frames == 1 or self._setup_ready_frames % 6 == 0:
+                print(
+                    f"setup: start-like — holding {self._setup_ready_frames}/12 "
+                    f"({occupancy_debug_summary(occ.grid)})"
+                )
         else:
-            if self._setup_tick % 45 == 0:
-                n = int(np.count_nonzero(occ.grid))
-                back = int(occ.grid[0:2].sum() + occ.grid[6:8].sum())
-                mid = int(occ.grid[2:6].sum())
-                print(f"setup: waiting (occupied≈{n}, backranks≈{back}, mid≈{mid})")
             self._setup_ready_frames = 0
             return
         if self._setup_ready_frames < 12:

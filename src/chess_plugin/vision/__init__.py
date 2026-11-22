@@ -497,6 +497,22 @@ def occupancy_from_board(board: chess.Board) -> np.ndarray:
     return g
 
 
+def occupancy_debug_summary(grid: np.ndarray) -> str:
+    """One-line debug: piece counts vs starting position (row0=rank8 … row7=rank1)."""
+    g = np.asarray(grid, dtype=bool)
+    expected = occupancy_from_board(chess.Board())
+    n = int(g.sum())
+    miss = occupancy_mismatch(g, expected)
+    per_rank = [int(g[r].sum()) for r in range(8)]
+    # rank labels from white's perspective at bottom of warped board (row7 = rank1)
+    rank_bits = " ".join(f"r{8 - r}:{per_rank[r]}" for r in range(8))
+    back = per_rank[0] + per_rank[1] + per_rank[6] + per_rank[7]
+    mid = sum(per_rank[2:6])
+    return (
+        f"pieces≈{n}/32 mismatch≈{miss} back≈{back}/32 mid≈{mid}/0 | {rank_bits}"
+    )
+
+
 def looks_like_starting_occupancy(
     grid: np.ndarray,
     *,
