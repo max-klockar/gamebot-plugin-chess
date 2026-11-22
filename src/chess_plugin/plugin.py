@@ -98,9 +98,12 @@ class ChessGameSession:
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
         self._setup_ready_frames = 0
-        self._setup_lock_every = 5
+        self._setup_lock_every = 10
         self._setup_tick = 0
         self._lock_border_proj_px: np.ndarray | None = None
+        self._last_good_quad: np.ndarray | None = None
+        self._last_good_method: str | None = None
+        self._lock_misses = 0
 
     def _apply_board_corners(
         self,
@@ -189,23 +192,40 @@ class ChessGameSession:
             from gamebot.board_detect import detect_physical_board_quad
         except Exception as exc:  # noqa: BLE001
             print(f"board lock: unavailable ({exc})")
-            return None
+            return self._last_good_quad
         try:
-            result = detect_physical_board_quad(frame_bgr)
+            # Chessboard only — wood_contour flaps under projection / cyan table.
+            result = detect_physical_board_quad(frame_bgr, conf=0.05, allow_wood=False)
         except Exception as exc:  # noqa: BLE001
             print(f"board lock: failed ({exc})")
-            return None
+            self._lock_misses += 1
+            return self._last_good_quad if self._lock_misses < 12 else None
         if result is None:
-            print("board lock: no board found")
+            self._lock_misses += 1
+            if self._last_good_quad is not None and self._lock_misses < 12:
+                return self._last_good_quad
+            if self._lock_misses % 15 == 1:
+                print("board lock: no board found")
             return None
+
+        self._lock_misses = 0
+        # Hold a stable chessboard lock — ignore tiny jitter jumps.
+        if self._last_good_quad is not None:
+            delta = float(np.mean(np.linalg.norm(result.quad - self._last_good_quad, axis=1)))
+            if delta < 6.0 and result.method == self._last_good_method:
+                return self._last_good_quad
+
         aabb = result.aabb
-        print(
-            f"board lock: {result.method}  aabb=({aabb[0]},{aabb[1]})-({aabb[2]},{aabb[3]}) "
-            f"frame={frame_bgr.shape[1]}x{frame_bgr.shape[0]}"
-        )
+        if result.method != self._last_good_method:
+            print(
+                f"board lock: {result.method}  aabb=({aabb[0]},{aabb[1]})-({aabb[2]},{aabb[3]}) "
+                f"frame={frame_bgr.shape[1]}x{frame_bgr.shape[0]}"
+            )
         self._apply_board_corners(
             result.quad, force_square=False, update_projector=update_projector
         )
+        self._last_good_quad = result.quad.copy()
+        self._last_good_method = result.method
         self._last_lock_method = result.method
         return result.quad
 
