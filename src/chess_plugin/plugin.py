@@ -97,19 +97,24 @@ class ChessGameSession:
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
 
-    def _apply_board_corners(self, board_cam: np.ndarray) -> None:
-        """Update calibration so table↔camera↔projector match the piece-defined board."""
+    def _apply_board_corners(self, board_cam: np.ndarray, *, force_square: bool = True) -> None:
+        """Update calibration so table↔camera↔projector match the board quad.
+
+        `force_square=True` for projected / corner-piece setup (keep overlays square).
+        Physical YOLO+mech quads must stay trapezoid (`force_square=False`).
+        """
         cal = self._calibration
         if cal is None:
             return
-        # Projected board must stay square (shortest edge → length & width).
-        board_cam = force_square_quad(board_cam)
+        board_cam = np.asarray(board_cam, dtype=np.float64).reshape(4, 2)
+        if force_square:
+            board_cam = force_square_quad(board_cam)
         table = self.layout.board_corners()
         H_t2c = estimate_homography(table, board_cam)
         if H_t2c is None:
             return
         H_t2p = cal.H_camera_to_projector @ H_t2c
-        cal.board_corners_camera = np.asarray(board_cam, dtype=np.float64)
+        cal.board_corners_camera = board_cam
         cal.H_table_to_camera = H_t2c
         cal.H_table_to_projector = H_t2p
         # Host renderer follows projector H when present
@@ -138,8 +143,27 @@ class ChessGameSession:
         warped = warp_board(frame_bgr, cal.board_corners_camera, out_size=400)
         return cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
+    def _lock_physical_board(self, frame_bgr: np.ndarray) -> np.ndarray | None:
+        """YOLO AABB + classical corner refine → playing-field quad in camera px."""
+        try:
+            from gamebot.board_detect import detect_physical_board_quad
+        except Exception as exc:  # noqa: BLE001
+            print(f"board lock: unavailable ({exc})")
+            return None
+        try:
+            result = detect_physical_board_quad(frame_bgr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"board lock: failed ({exc})")
+            return None
+        if result is None:
+            print("board lock: no board found")
+            return None
+        self._apply_board_corners(result.quad, force_square=False)
+        print(f"board lock: {result.method}")
+        return result.quad
+
     def _resolve_setup_from_camera(self) -> bool:
-        """One white corner piece ⇒ colour (+ snap board). Optional black for full pose."""
+        """Lock physical board (YOLO+mech), then corner-piece colour / optional pose."""
         cal = self._calibration
         cam = self._camera
         if cal is None or cam is None:
@@ -150,7 +174,8 @@ class ChessGameSession:
         for _ in range(3):
             frame = cam.read()
 
-        roi = cal.board_corners_camera
+        locked = self._lock_physical_board(frame)
+        roi = locked if locked is not None else cal.board_corners_camera
         setup = setup_from_corner_pieces(frame, search_roi=roi, existing_board=roi)
         if setup is None:
             setup = setup_from_corner_pieces(frame, search_roi=None, existing_board=roi)
