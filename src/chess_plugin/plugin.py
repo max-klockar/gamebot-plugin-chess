@@ -138,6 +138,24 @@ class ChessGameSession:
                 renderer.set_homography(H_t2p)
             else:
                 print("board lock: renderer missing — border may not move")
+            # Debug (throttled): colour-cal default quad is ~scale 0.32 (~230px on 720p).
+            self._lock_dbg_i = getattr(self, "_lock_dbg_i", 0) + 1
+            if self._lock_dbg_i <= 3 or self._lock_dbg_i % 8 == 0:
+                cam_w = float(np.linalg.norm(board_cam[1] - board_cam[0]))
+                cam_h = float(np.linalg.norm(board_cam[3] - board_cam[0]))
+                proj_w = float(np.linalg.norm(board_proj[1] - board_proj[0]))
+                proj_h = float(np.linalg.norm(board_proj[3] - board_proj[0]))
+                pw, ph = cal.projector_size
+                cw, ch = cal.camera_size
+                print(
+                    f"board lock debug: cam_quad≈{cam_w:.0f}x{cam_h:.0f}px "
+                    f"(frame {cw}x{ch})  proj_quad≈{proj_w:.0f}x{proj_h:.0f}px "
+                    f"(frame {pw}x{ph})  renderer={'yes' if renderer else 'NO'}"
+                )
+                print(
+                    f"  cam={np.round(board_cam, 1).tolist()}\n"
+                    f"  proj={np.round(board_proj, 1).tolist()}"
+                )
         path = getattr(self.runtime.config, "calibration_path", None)
         if path is not None:
             try:
@@ -180,12 +198,15 @@ class ChessGameSession:
         if result is None:
             print("board lock: no board found")
             return None
+        aabb = result.aabb
+        print(
+            f"board lock: {result.method}  aabb=({aabb[0]},{aabb[1]})-({aabb[2]},{aabb[3]}) "
+            f"frame={frame_bgr.shape[1]}x{frame_bgr.shape[0]}"
+        )
         self._apply_board_corners(
             result.quad, force_square=False, update_projector=update_projector
         )
-        if getattr(self, "_last_lock_method", None) != result.method:
-            print(f"board lock: {result.method}")
-            self._last_lock_method = result.method
+        self._last_lock_method = result.method
         return result.quad
 
     def _resolve_setup_from_camera(self) -> bool:
