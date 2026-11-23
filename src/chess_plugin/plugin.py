@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
 import chess
 import cv2
 import numpy as np
@@ -29,6 +34,7 @@ from chess_plugin.vision import (
     energy_on_squares,
     mask_energy_squares,
     square_diff_energy,
+    square_rc,
     squares_affected_by_move,
     warp_board,
 )
@@ -101,6 +107,9 @@ class ChessGameSession:
         self._settle_saw_motion = False
         self._settle_baseline: np.ndarray | None = None
         self._settle_unclear_rounds = 0
+        self._settle_dual_uci: str | None = None
+        self._settle_dual_count = 0
+        self._human_ignore_until = 0.0
         self._fault_baseline: np.ndarray | None = None
         self._fault_clear_frames = 0
         self._pending_uci: str | None = None
@@ -113,6 +122,8 @@ class ChessGameSession:
         self._settle_unclear_limit = 5
         self._fault_confirm_frames = 12
         self._fault_clear_need = 10
+        self._state_log_path = Path(runtime.data_dir) / "chess_state.log"
+        self._state_json_path = Path(runtime.data_dir) / "chess_state.json"
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
         self._setup_ready_frames = 0
@@ -131,6 +142,46 @@ class ChessGameSession:
         if led is not None and hasattr(led, "set_mode"):
             led.set_mode(mode)
 
+    def _log_state(self, event: str, **extra: object) -> None:
+        """Append a debug line + refresh chess_state.json (FEN / turn / settle)."""
+        s = self.session
+        turn = "white" if s.board.turn == chess.WHITE else "black"
+        whose = "human" if s.is_human_turn() else ("bot" if s.phase == Phase.PLAY else s.phase.name)
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "event": event,
+            "phase": s.phase.name,
+            "fen": s.board.fen(),
+            "turn": turn,
+            "to_move": whose,
+            "human_is_white": s.human_is_white,
+            "last_engine": s.last_engine_move.uci() if s.last_engine_move else None,
+            "awaiting_settle": self._awaiting_settle,
+            "settle_unclear": self._settle_unclear_rounds,
+            "pending_uci": self._pending_uci,
+            "revert": (
+                f"{chess.square_name(s.revert_hint.from_sq)}"
+                f"{chess.square_name(s.revert_hint.to_sq)}:{s.revert_hint.reason}"
+                if s.revert_hint
+                else None
+            ),
+            "moves": [m.uci() for m in s.board.move_stack],
+        }
+        payload.update(extra)
+        line = json.dumps(payload, ensure_ascii=True)
+        try:
+            self._state_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._state_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            self._state_json_path.write_text(line + "\n", encoding="utf-8")
+        except OSError as exc:
+            if self._dbg_tick % 100 == 0:
+                print(f"state log write failed: {exc}")
+        print(
+            f"state: {event} | {s.phase.name} {whose} FEN={s.board.board_fen()} "
+            f"settle={self._awaiting_settle} eng={payload['last_engine']}"
+        )
+
     def _enter_fault(self, reason: str, *, baseline: np.ndarray | None = None) -> None:
         print(f"FAULT — {reason} (waiting until board matches again)")
         self._set_led(LedMode.ERROR)
@@ -143,6 +194,7 @@ class ChessGameSession:
             self._fault_baseline = baseline.copy()
         elif self._prev_warped is not None and self._fault_baseline is None:
             self._fault_baseline = self._prev_warped.copy()
+        self._log_state("fault", reason=reason)
 
     def _clear_fault_state(self) -> None:
         self.session.clear_fault()
@@ -153,6 +205,7 @@ class ChessGameSession:
         self._pending_count = 0
         self._sync_turn_led()
         print("fault cleared — board looks right again")
+        self._log_state("fault_cleared")
 
     def _sync_turn_led(self) -> None:
         s = self.session
@@ -623,10 +676,13 @@ class ChessGameSession:
         self._pending_count = 0
         self._setup_ready_frames = 0
         self._sync_turn_led()
+        self._log_state("game_start", side=side)
 
     def _do_engine_turn(self) -> None:
         s = self.session
         if s.phase != Phase.PLAY or s.is_human_turn():
+            return
+        if self._awaiting_settle:
             return
         thinking = getattr(self.runtime, "thinking", None)
         if callable(thinking):
@@ -637,7 +693,10 @@ class ChessGameSession:
                 f"skill={s.skill_level}"
             )
             result = self.engine.play(s.board, s.skill_level)
-            s.apply_engine_move(result.move)
+            if not s.apply_engine_move(result.move):
+                print(f"engine move rejected: {result.move.uci()}")
+                self._log_state("engine_rejected", uci=result.move.uci())
+                return
             print(
                 f"engine played {result.move.uci()} — place along the arrow "
                 "(you can also play your reply in the same motion)"
@@ -653,12 +712,16 @@ class ChessGameSession:
             self._settle_frames = 0
             self._settle_saw_motion = False
             self._settle_unclear_rounds = 0
+            self._settle_dual_uci = None
+            self._settle_dual_count = 0
             self._pending_uci = None
             self._pending_count = 0
             self._pending_fault = 0
             self._set_led(LedMode.BOT_TURN)
+            self._log_state("engine_played", uci=result.move.uci())
         except Exception as exc:  # noqa: BLE001 — keep session alive
             print(f"engine turn failed: {exc}")
+            self._log_state("engine_error", error=str(exc))
         finally:
             if callable(thinking):
                 thinking(False)
@@ -713,8 +776,24 @@ class ChessGameSession:
         if gray is not None:
             self._last_gray = gray
 
+    def _hand_to_player_after_bot(self, gray: np.ndarray) -> None:
+        s = self.session
+        self._awaiting_settle = False
+        self._settle_baseline = None
+        self._settle_unclear_rounds = 0
+        self._settle_dual_uci = None
+        self._settle_dual_count = 0
+        s.last_engine_move = None
+        s.last_engine_promotion = None
+        self._prev_warped = gray.copy()
+        # Ignore phantom human moves for a moment (hand leaving / lighting).
+        self._human_ignore_until = time.monotonic() + 1.2
+        print("board settled — your move")
+        self._set_led(LedMode.PLAYER_TURN)
+        self._log_state("settle_player_turn")
+
     def _finish_bot_settle(self, gray: np.ndarray) -> None:
-        """After bot arrow: A = only bot piece, B = bot + human reply in one motion.
+        """After bot arrow: A = only bot piece, B = bot + human reply (strict, confirmed).
 
         Unclear diffs re-check a few times (fast); only then soft-fault.
         """
@@ -725,16 +804,21 @@ class ChessGameSession:
         self._pending_fault = 0
 
         engine_move = s.last_engine_move
-        if baseline is None or engine_move is None or not s.is_human_turn():
-            self._awaiting_settle = False
-            self._settle_baseline = None
-            self._settle_unclear_rounds = 0
-            self._prev_warped = gray.copy()
-            if s.is_human_turn():
-                s.last_engine_move = None
-                s.last_engine_promotion = None
-                print("board settled — your move")
-                self._set_led(LedMode.PLAYER_TURN)
+        # Never drop settle while it's still the bot's logical turn.
+        if not s.is_human_turn():
+            self._log_state("settle_skip_not_human_turn")
+            return
+        if engine_move is None:
+            self._hand_to_player_after_bot(gray)
+            return
+        if baseline is None:
+            # Late baseline: treat current frame as pre-place and keep waiting.
+            print("settle: no baseline yet — locking one and waiting for bot place")
+            self._settle_baseline = gray.copy()
+            self._awaiting_settle = True
+            self._settle_frames = 0
+            self._settle_saw_motion = False
+            self._log_state("settle_baseline_locked")
             return
 
         energy = square_diff_energy(baseline, gray)
@@ -743,14 +827,9 @@ class ChessGameSession:
         bot_squares = squares_affected_by_move(before, engine_move)
         bot_e = energy_on_squares(energy, bot_squares)
         residual = mask_energy_squares(energy, bot_squares, factor=0.0)
-        hyps = hypothesize_moves_from_diff(residual, s.board, min_square=8.0)
+        hyps = hypothesize_moves_from_diff(residual, s.board, min_square=12.0)
         best = hyps[0] if hyps else None
         second = hyps[1].score if len(hyps) > 1 else 0.0
-        dual = (
-            best is not None
-            and best.score >= 24.0
-            and (second <= 0 or best.score >= second * 1.3)
-        )
 
         flat = sorted(
             ((float(residual[r, c]), r, c) for r in range(8) for c in range(8)),
@@ -758,16 +837,51 @@ class ChessGameSession:
         )
         top_residual = sum(v for v, _, _ in flat[:4])
 
+        # Combo only if bot place is clear AND both ends of a human move light up strongly.
+        dual = False
+        if best is not None and bot_e >= 18.0:
+            fr, fc = square_rc(best.move.from_square)
+            tr, tc = square_rc(best.move.to_square)
+            e_from = float(residual[fr, fc])
+            e_to = float(residual[tr, tc])
+            explained = e_from + e_to
+            dual = (
+                e_from >= 16.0
+                and e_to >= 16.0
+                and best.score >= 45.0
+                and (second <= 0 or best.score >= second * 1.45)
+                and explained >= top_residual * 0.55
+            )
+
         if dual and best is not None:
+            uci = best.move.uci()
+            if uci == self._settle_dual_uci:
+                self._settle_dual_count += 1
+            else:
+                self._settle_dual_uci = uci
+                self._settle_dual_count = 1
+            if self._settle_dual_count < 2:
+                self._log_state("settle_combo_candidate", uci=uci, bot_e=bot_e, residual=top_residual)
+                print(f"combo candidate {uci} ({self._settle_dual_count}/2) — confirm…")
+                self._settle_baseline = baseline.copy()
+                self._awaiting_settle = True
+                self._settle_frames = 0
+                self._settle_saw_motion = True
+                self._set_led(LedMode.BOT_TURN)
+                return
             if s.try_human_move(best.move):
                 self._awaiting_settle = False
                 self._settle_baseline = None
                 self._settle_unclear_rounds = 0
-                print(f"board settled — bot placed + your {best.move.uci()} (combo)")
+                self._settle_dual_uci = None
+                self._settle_dual_count = 0
+                print(f"board settled — bot placed + your {uci} (combo)")
                 s.last_engine_move = None
                 s.last_engine_promotion = None
                 self._prev_warped = gray.copy()
+                self._human_ignore_until = time.monotonic() + 0.4
                 self._sync_turn_led()
+                self._log_state("settle_combo", uci=uci)
                 return
             if s.phase == Phase.FAULT:
                 self._awaiting_settle = False
@@ -778,17 +892,13 @@ class ChessGameSession:
                     baseline=baseline,
                 )
                 return
+        else:
+            self._settle_dual_uci = None
+            self._settle_dual_count = 0
 
         # A: bot squares changed and leftover is quiet → hand off to player.
         if bot_e >= 14.0 and top_residual < 28.0:
-            self._awaiting_settle = False
-            self._settle_baseline = None
-            self._settle_unclear_rounds = 0
-            s.last_engine_move = None
-            s.last_engine_promotion = None
-            self._prev_warped = gray.copy()
-            print("board settled — your move")
-            self._set_led(LedMode.PLAYER_TURN)
+            self._hand_to_player_after_bot(gray)
             return
 
         # Not placed yet, or hand mid-move — re-check a few rounds before alerting.
@@ -908,6 +1018,13 @@ class ChessGameSession:
         if not s.is_human_turn():
             return
 
+        # Right after bot settle — don't treat hand-leaving noise as your move.
+        if time.monotonic() < self._human_ignore_until:
+            self._pending_uci = None
+            self._pending_count = 0
+            self._pending_fault = 0
+            return
+
         # Hand still moving — don't commit a move yet.
         if frame_motion > 5.0:
             self._pending_uci = None
@@ -973,6 +1090,7 @@ class ChessGameSession:
             self._pending_uci = None
             self._pending_count = 0
             self._sync_turn_led()
+            self._log_state("human_move", uci=uci, score=best.score)
         elif s.phase == Phase.FAULT:
             good = self._prev_warped.copy() if self._prev_warped is not None else None
             self._enter_fault(
