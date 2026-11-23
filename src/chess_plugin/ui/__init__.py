@@ -79,13 +79,40 @@ def build_play_overlay(
     if revert is not None:
         x0, y0 = layout.square_center(revert[0])
         x1, y1 = layout.square_center(revert[1])
-        scene.add_arrow(x0, y0, x1, y1, (40, 40, 255))
-        scene.add_text("Illegal — move back", layout.margin_mm, layout.margin_mm - 30, (40, 40, 255))
+        # Thick red “undo” arrow on the unexpected squares
+        scene.add_arrow(x0, y0, x1, y1, (0, 0, 255))
+        scene.add_text("Illegal — put pieces back", layout.margin_mm, layout.margin_mm - 30, (0, 0, 255))
     if engine_promo_label:
         ox = layout.margin_mm + layout.board_size_mm + 40
         oy = layout.margin_mm + 40
         scene.add_icon(engine_promo_label, ox, oy)
         scene.add_text(f"Bot promoted to {engine_promo_label}", ox - 20, oy + 50)
+    return scene
+
+
+def build_fault_scene(
+    layout: TableLayout,
+    revert: tuple[chess.Square, chess.Square] | None,
+    reason: str,
+) -> Scene:
+    """Hard stop: highlight the bad move and wait for Resume / Again."""
+    scene = Scene(layout)
+    scene.title = "Board fault"
+    scene.project_chessboard = False
+    scene.project_board_border = False
+    if revert is not None:
+        x0, y0 = layout.square_center(revert[0])
+        x1, y1 = layout.square_center(revert[1])
+        scene.add_arrow(x0, y0, x1, y1, (0, 0, 255))
+    scene.add_text(
+        f"Unexpected ({reason}) — fix the board, then Resume",
+        layout.margin_mm,
+        layout.margin_mm - 30,
+        (0, 0, 255),
+    )
+    ox = layout.margin_mm + layout.board_size_mm + 10
+    scene.add_button("fault:resume", "Resume", ox, layout.margin_mm, 110, 44)
+    scene.add_button("fault:again", "Again", ox, layout.margin_mm + 56, 110, 44)
     return scene
 
 

@@ -83,6 +83,7 @@ class Phase(Enum):
     WAIT_SETUP = auto()  # physical starting position not ready yet
     PLAY = auto()
     PROMOTE = auto()
+    FAULT = auto()  # illegal / unexpected — halted until human fixes + resumes
     GAME_OVER = auto()
 
 
@@ -251,9 +252,8 @@ class ChessSession:
             promotion=piece_type,
         )
         if move not in self.board.legal_moves:
-            self._reject_move(move, "illegal_promotion")
             self.pending_promotion = None
-            self.phase = Phase.PLAY
+            self._reject_move(move, "illegal_promotion")
             return False
         self.pending_promotion = None
         self.phase = Phase.PLAY
@@ -274,7 +274,22 @@ class ChessSession:
 
     def _reject_move(self, move: chess.Move, reason: str) -> None:
         self.revert_hint = RevertHint(move.to_square, move.from_square, reason)
+        self.phase = Phase.FAULT
         self.emit("illegal_move", uci=move.uci(), reason=reason)
+
+    def enter_fault(self, from_sq: chess.Square, to_sq: chess.Square, reason: str) -> None:
+        """Halt on unexpected board change (not necessarily a legal-move candidate)."""
+        self.revert_hint = RevertHint(from_sq, to_sq, reason)
+        self.phase = Phase.FAULT
+        self.emit("board_fault", reason=reason)
+
+    def clear_fault(self) -> None:
+        """Resume play after the physical board matches the internal position."""
+        if self.phase != Phase.FAULT:
+            return
+        self.revert_hint = None
+        self.phase = Phase.PLAY
+        self.emit("fault_cleared")
 
     def _apply_and_record(self, move: chess.Move, by_engine: bool) -> None:
         san = self.board.san(move)

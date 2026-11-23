@@ -328,6 +328,41 @@ def square_diff_energy(prev_gray: np.ndarray, curr_gray: np.ndarray, inset_frac:
     return energy
 
 
+def square_rc(sq: chess.Square) -> tuple[int, int]:
+    """Board image row/col for a chess square (rank 8 = row 0)."""
+    return 7 - chess.square_rank(sq), chess.square_file(sq)
+
+
+def squares_affected_by_move(board_before: chess.Board, move: chess.Move) -> list[chess.Square]:
+    """Squares that change when `move` is played on `board_before`."""
+    sqs = [move.from_square, move.to_square]
+    if board_before.is_castling(move):
+        if board_before.is_kingside_castling(move):
+            rook_from = chess.H1 if board_before.turn == chess.WHITE else chess.H8
+            rook_to = chess.F1 if board_before.turn == chess.WHITE else chess.F8
+        else:
+            rook_from = chess.A1 if board_before.turn == chess.WHITE else chess.A8
+            rook_to = chess.D1 if board_before.turn == chess.WHITE else chess.D8
+        sqs.extend([rook_from, rook_to])
+    elif board_before.is_en_passant(move):
+        cap = chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))
+        sqs.append(cap)
+    return sqs
+
+
+def mask_energy_squares(energy: np.ndarray, squares: list[chess.Square], factor: float = 0.0) -> np.ndarray:
+    """Copy of energy with listed squares attenuated (0 = fully explained away)."""
+    out = energy.copy()
+    for sq in squares:
+        r, c = square_rc(sq)
+        out[r, c] *= factor
+    return out
+
+
+def energy_on_squares(energy: np.ndarray, squares: list[chess.Square]) -> float:
+    return float(sum(energy[square_rc(sq)] for sq in squares))
+
+
 def hypothesize_moves_from_diff(
     energy: np.ndarray,
     board: chess.Board,
@@ -335,14 +370,10 @@ def hypothesize_moves_from_diff(
     min_square: float = 10.0,
 ) -> list[MoveHypothesis]:
     """Score legal moves by how much their from/to squares changed in the board ROI."""
-
-    def idx(sq: chess.Square) -> tuple[int, int]:
-        return 7 - chess.square_rank(sq), chess.square_file(sq)
-
     scored: list[MoveHypothesis] = []
     for m in board.legal_moves:
-        fr, fc = idx(m.from_square)
-        tr, tc = idx(m.to_square)
+        fr, fc = square_rc(m.from_square)
+        tr, tc = square_rc(m.to_square)
         e_from = float(energy[fr, fc])
         e_to = float(energy[tr, tc])
         if e_from < min_square and e_to < min_square:
