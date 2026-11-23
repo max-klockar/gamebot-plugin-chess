@@ -95,7 +95,7 @@ def build_fault_scene(
     revert: tuple[chess.Square, chess.Square] | None,
     reason: str,
 ) -> Scene:
-    """Hard stop: highlight the bad move and wait for Resume / Again."""
+    """Soft stop: highlight the suspect squares; auto-resumes when the board matches again."""
     scene = Scene(layout)
     scene.title = "Board fault"
     scene.project_chessboard = False
@@ -103,16 +103,13 @@ def build_fault_scene(
     if revert is not None:
         x0, y0 = layout.square_center(revert[0])
         x1, y1 = layout.square_center(revert[1])
-        scene.add_arrow(x0, y0, x1, y1, (0, 0, 255))
+        scene.add_arrow(x0, y0, x1, y1, (0, 0, 220))
     scene.add_text(
-        f"Unexpected ({reason}) — fix the board, then Resume",
+        f"Unexpected ({reason}) — fix the board…",
         layout.margin_mm,
         layout.margin_mm - 30,
-        (0, 0, 255),
+        (0, 0, 220),
     )
-    ox = layout.margin_mm + layout.board_size_mm + 10
-    scene.add_button("fault:resume", "Resume", ox, layout.margin_mm, 110, 44)
-    scene.add_button("fault:again", "Again", ox, layout.margin_mm + 56, 110, 44)
     return scene
 
 

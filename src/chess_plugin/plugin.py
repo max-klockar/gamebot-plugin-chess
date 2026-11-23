@@ -100,11 +100,17 @@ class ChessGameSession:
         self._settle_frames = 0
         self._settle_saw_motion = False
         self._settle_baseline: np.ndarray | None = None
+        self._fault_baseline: np.ndarray | None = None
+        self._fault_clear_frames = 0
         self._pending_uci: str | None = None
         self._pending_count = 0
         self._pending_fault = 0
         self._dbg_tick = 0
         self._exit = False
+        # Settle / fault patience (frames @ ~camera rate).
+        self._settle_still_frames = 35
+        self._fault_confirm_frames = 28
+        self._fault_clear_need = 18
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
         self._setup_ready_frames = 0
@@ -123,12 +129,28 @@ class ChessGameSession:
         if led is not None and hasattr(led, "set_mode"):
             led.set_mode(mode)
 
-    def _enter_fault(self, reason: str) -> None:
-        print(f"FAULT — {reason} (halted; fix board then Resume)")
+    def _enter_fault(self, reason: str, *, baseline: np.ndarray | None = None) -> None:
+        print(f"FAULT — {reason} (waiting until board matches again)")
         self._set_led(LedMode.ERROR)
         self._awaiting_settle = False
         self._pending_uci = None
         self._pending_count = 0
+        self._pending_fault = 0
+        self._fault_clear_frames = 0
+        if baseline is not None:
+            self._fault_baseline = baseline.copy()
+        elif self._prev_warped is not None and self._fault_baseline is None:
+            self._fault_baseline = self._prev_warped.copy()
+
+    def _clear_fault_state(self) -> None:
+        self.session.clear_fault()
+        self._fault_baseline = None
+        self._fault_clear_frames = 0
+        self._pending_fault = 0
+        self._pending_uci = None
+        self._pending_count = 0
+        self._sync_turn_led()
+        print("fault cleared — board looks right again")
 
     def _sync_turn_led(self) -> None:
         s = self.session
@@ -514,17 +536,7 @@ class ChessGameSession:
             self._pending_uci = None
             self._pending_count = 0
             return
-        if zone_id == "fault:resume":
-            s.clear_fault()
-            self._prev_warped = None
-            self._last_gray = None
-            self._pending_uci = None
-            self._pending_count = 0
-            self._pending_fault = 0
-            self._sync_turn_led()
-            print("fault cleared — resume play")
-            return
-        if zone_id == "fault:again" or zone_id == "again":
+        if zone_id == "again":
             s.phase = Phase.PROFILE
             self._set_led(LedMode.IDLE)
             return
@@ -546,6 +558,7 @@ class ChessGameSession:
             return
         if s.phase == Phase.FAULT:
             self._set_led(LedMode.ERROR)
+            self._poll_fault_recover(frame_bgr)
             return
         if s.phase != Phase.PLAY:
             return
@@ -584,12 +597,13 @@ class ChessGameSession:
             print(f"setup occupancy: {summary}")
         if ready:
             self._setup_ready_frames += 1
-            if self._setup_ready_frames == 1 or self._setup_ready_frames % 6 == 0:
-                print(f"setup: start-like — holding {self._setup_ready_frames}/12 ({summary})")
+            if self._setup_ready_frames == 1 or self._setup_ready_frames % 4 == 0:
+                print(f"setup: start-like — holding {self._setup_ready_frames}/8 ({summary})")
         else:
-            self._setup_ready_frames = 0
+            # Soft decay — brief YOLO flaps (30↔32) shouldn't restart the whole wait.
+            self._setup_ready_frames = max(0, self._setup_ready_frames - 2)
             return
-        if self._setup_ready_frames < 12:
+        if self._setup_ready_frames < 8:
             return
 
         human_white = self._resolve_setup_from_camera()
@@ -661,18 +675,31 @@ class ChessGameSession:
         self._awaiting_settle = True
         self._settle_frames = 0
 
+    def _keep_waiting_settle(self, baseline: np.ndarray, why: str) -> None:
+        """Stay in bot-place settle — never fault mid-hand."""
+        print(f"{why} — still waiting for a clean settle…")
+        self._settle_baseline = baseline.copy()
+        self._awaiting_settle = True
+        self._settle_frames = 0
+        # Keep saw_motion so we only need more stillness, not another wave.
+        self._settle_saw_motion = True
+        self._set_led(LedMode.BOT_TURN)
+
     def _finish_bot_settle(self, gray: np.ndarray) -> None:
-        """After bot arrow: A = only bot piece, B = bot + human reply in one motion."""
+        """After bot arrow: A = only bot piece, B = bot + human reply in one motion.
+
+        Mid-hand / ambiguous diffs just wait longer — never enter FAULT here.
+        """
         s = self.session
         baseline = self._settle_baseline if self._settle_baseline is not None else self._prev_warped
-        self._awaiting_settle = False
-        self._settle_baseline = None
         self._pending_uci = None
         self._pending_count = 0
         self._pending_fault = 0
 
         engine_move = s.last_engine_move
         if baseline is None or engine_move is None or not s.is_human_turn():
+            self._awaiting_settle = False
+            self._settle_baseline = None
             self._prev_warped = gray.copy()
             if s.is_human_turn():
                 s.last_engine_move = None
@@ -692,54 +719,126 @@ class ChessGameSession:
         second = hyps[1].score if len(hyps) > 1 else 0.0
         dual = (
             best is not None
-            and best.score >= 22.0
-            and (second <= 0 or best.score >= second * 1.25)
+            and best.score >= 24.0
+            and (second <= 0 or best.score >= second * 1.3)
         )
 
-        if dual and best is not None and s.try_human_move(best.move):
-            # B: bot placed + human replied in the same motion → clear arrow, next bot turn.
-            print(f"board settled — bot placed + your {best.move.uci()} (combo)")
-            s.last_engine_move = None
-            s.last_engine_promotion = None
-            self._prev_warped = gray.copy()
-            self._sync_turn_led()
-            return
-
-        if s.phase == Phase.FAULT:
-            self._enter_fault(s.revert_hint.reason if s.revert_hint else "illegal")
-            self._prev_warped = gray.copy()
-            return
-
-        # Strong leftover change that isn't a legal reply → halt.
         flat = sorted(
             ((float(residual[r, c]), r, c) for r in range(8) for c in range(8)),
             reverse=True,
         )
         top_residual = sum(v for v, _, _ in flat[:4])
-        if top_residual >= 55.0:
-            r0, c0 = flat[0][1], flat[0][2]
-            r1, c1 = flat[1][1], flat[1][2]
-            s.enter_fault(chess.square(c0, 7 - r0), chess.square(c1, 7 - r1), "unexpected")
-            self._enter_fault("unexpected change while placing bot piece")
+
+        if dual and best is not None:
+            if s.try_human_move(best.move):
+                self._awaiting_settle = False
+                self._settle_baseline = None
+                print(f"board settled — bot placed + your {best.move.uci()} (combo)")
+                s.last_engine_move = None
+                s.last_engine_promotion = None
+                self._prev_warped = gray.copy()
+                self._sync_turn_led()
+                return
+            if s.phase == Phase.FAULT:
+                # Illegal reply while placing — soft fault, keep good baseline.
+                self._awaiting_settle = False
+                self._settle_baseline = None
+                self._enter_fault(
+                    s.revert_hint.reason if s.revert_hint else "illegal",
+                    baseline=baseline,
+                )
+                return
+
+        # A: bot squares changed and leftover is quiet → hand off to player.
+        if bot_e >= 14.0 and top_residual < 28.0:
+            self._awaiting_settle = False
+            self._settle_baseline = None
+            s.last_engine_move = None
+            s.last_engine_promotion = None
             self._prev_warped = gray.copy()
+            print("board settled — your move")
+            self._set_led(LedMode.PLAYER_TURN)
             return
 
-        # A: only the bot piece (or quiet board after placing) → your turn.
         if bot_e < 12.0 and top_residual < 20.0:
-            # Almost no change vs pre-bot baseline — keep arrow and wait again.
-            print("board settled but bot piece not seen yet — keep placing along the arrow")
-            self._settle_baseline = baseline.copy()
-            self._awaiting_settle = True
-            self._settle_frames = 0
-            self._settle_saw_motion = False
-            self._set_led(LedMode.BOT_TURN)
+            self._keep_waiting_settle(baseline, "bot piece not clearly placed yet")
             return
 
-        s.last_engine_move = None
-        s.last_engine_promotion = None
-        self._prev_warped = gray.copy()
-        print("board settled — your move")
-        self._set_led(LedMode.PLAYER_TURN)
+        # Hand still in frame / half-move — chill and look again after more stillness.
+        self._keep_waiting_settle(
+            baseline,
+            f"settle unclear (bot_e={bot_e:.0f} residual={top_residual:.0f})",
+        )
+
+    def _poll_fault_recover(self, frame_bgr: np.ndarray) -> None:
+        """Keep watching during FAULT; auto-clear when the board matches again (or a legal move)."""
+        s = self.session
+        if s.phase != Phase.FAULT:
+            return
+        gray = self._snapshot_board_gray(frame_bgr)
+        if gray is None:
+            return
+        self._dbg_tick += 1
+        if self._last_gray is None:
+            self._last_gray = gray
+            return
+        frame_motion = float(np.mean(cv2.absdiff(self._last_gray, gray)))
+        self._last_gray = gray
+        if frame_motion > 5.0:
+            self._fault_clear_frames = 0
+            return
+
+        baseline = self._fault_baseline if self._fault_baseline is not None else self._prev_warped
+        if baseline is None:
+            self._fault_clear_frames += 1
+            if self._fault_clear_frames >= self._fault_clear_need:
+                self._prev_warped = gray.copy()
+                self._clear_fault_state()
+            return
+
+        energy = square_diff_energy(baseline, gray)
+        flat = sorted(
+            ((float(energy[r, c]), r, c) for r in range(8) for c in range(8)),
+            reverse=True,
+        )
+        top_energy = sum(v for v, _, _ in flat[:4])
+
+        # Board back to the known-good look → clear.
+        if top_energy < 22.0:
+            self._fault_clear_frames += 1
+            if self._fault_clear_frames >= self._fault_clear_need:
+                self._prev_warped = gray.copy()
+                self._clear_fault_state()
+            return
+
+        # Or they completed a legal move from the good baseline.
+        hyps = hypothesize_moves_from_diff(energy, s.board, min_square=8.0)
+        best = hyps[0] if hyps else None
+        second = hyps[1].score if len(hyps) > 1 else 0.0
+        confident = (
+            best is not None
+            and best.score >= 24.0
+            and (second <= 0 or best.score >= second * 1.3)
+        )
+        if confident and best is not None:
+            # Temporarily leave FAULT so try_human_move accepts PLAY-phase moves.
+            s.phase = Phase.PLAY
+            if s.try_human_move(best.move):
+                print(f"fault resolved via move {best.move.uci()}")
+                self._prev_warped = gray.copy()
+                self._fault_baseline = None
+                self._fault_clear_frames = 0
+                self._sync_turn_led()
+                return
+            # try_human_move may re-enter FAULT; keep waiting.
+            if s.phase != Phase.FAULT:
+                s.phase = Phase.FAULT
+            self._fault_clear_frames = 0
+            return
+
+        self._fault_clear_frames = 0
+        if self._dbg_tick % 40 == 0:
+            print(f"fault: still odd (energy={top_energy:.0f}) — fix the board…")
 
     def _poll_board_move(self, frame_bgr: np.ndarray) -> None:
         """Watch only the warped board ROI; detect moves via frame diff vs legal moves."""
@@ -760,9 +859,9 @@ class ChessGameSession:
         frame_motion = float(np.mean(cv2.absdiff(self._last_gray, gray)))
         self._last_gray = gray
 
-        # After engine arrow: wait for a real placement motion, then stillness.
+        # After engine arrow: wait for a real placement motion, then a long stillness.
         if self._awaiting_settle:
-            if frame_motion > 4.0:
+            if frame_motion > 3.5:
                 self._settle_frames = 0
                 self._settle_saw_motion = True
             else:
@@ -770,9 +869,10 @@ class ChessGameSession:
             if self._dbg_tick % 40 == 0:
                 print(
                     f"waiting for board to settle… motion={frame_motion:.1f} "
-                    f"saw_motion={self._settle_saw_motion}"
+                    f"saw_motion={self._settle_saw_motion} "
+                    f"still={self._settle_frames}/{self._settle_still_frames}"
                 )
-            if self._settle_saw_motion and self._settle_frames >= 10:
+            if self._settle_saw_motion and self._settle_frames >= self._settle_still_frames:
                 self._finish_bot_settle(gray)
             return
 
@@ -796,22 +896,27 @@ class ChessGameSession:
             and (second <= 0 or best.score >= second * 1.25)
         )
 
-        # Strong board change that doesn't match any legal move → hard stop.
+        # Strong unexplained change → only soft-fault after a long, still confirmation.
         flat = [(float(energy[r, c]), r, c) for r in range(8) for c in range(8)]
         flat.sort(reverse=True)
         top_energy = sum(v for v, _, _ in flat[:4])
-        if top_energy >= 55.0 and not confident:
+        if top_energy >= 70.0 and not confident:
             self._pending_fault += 1
             self._pending_uci = None
             self._pending_count = 0
-            if self._pending_fault >= 8:
+            if self._pending_fault >= self._fault_confirm_frames:
                 r0, c0 = flat[0][1], flat[0][2]
                 r1, c1 = flat[1][1], flat[1][2]
                 from_sq = chess.square(c0, 7 - r0)
                 to_sq = chess.square(c1, 7 - r1)
+                good = self._prev_warped.copy() if self._prev_warped is not None else None
                 s.enter_fault(from_sq, to_sq, "unexpected")
-                self._enter_fault("unexpected board change")
-                self._pending_fault = 0
+                self._enter_fault("unexpected board change", baseline=good)
+            elif self._dbg_tick % 30 == 0:
+                print(
+                    f"move watch: odd energy={top_energy:.0f} "
+                    f"({self._pending_fault}/{self._fault_confirm_frames}) — chilling…"
+                )
             return
         self._pending_fault = 0
 
@@ -840,7 +945,11 @@ class ChessGameSession:
             self._pending_count = 0
             self._sync_turn_led()
         elif s.phase == Phase.FAULT:
-            self._enter_fault(s.revert_hint.reason if s.revert_hint else "illegal")
+            good = self._prev_warped.copy() if self._prev_warped is not None else None
+            self._enter_fault(
+                s.revert_hint.reason if s.revert_hint else "illegal",
+                baseline=good,
+            )
 
 
 class ChessPlugin:
