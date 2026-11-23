@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,7 +35,6 @@ from chess_plugin.vision import (
     occupancy_from_board,
     occupancy_mismatch,
     setup_from_corner_pieces,
-    square_rc,
     warp_board,
 )
 from gamebot.adapters.camera import MockCamera
@@ -43,17 +44,42 @@ from gamebot.plugins.protocol import IdentifyContext, RuntimeHandles
 from gamebot.ui import Scene
 
 
-def arrow_release(origin_occupied: bool, dest_occupied: bool, saw_home: bool) -> tuple[bool, bool]:
-    """Whether to stop the engine arrow, and the updated home latch.
+# How long the move arrow stays up before a dark gap. The gap throws away one
+# frame that can still contain the previous light, then scores the next one.
+ARROW_ON_S = 0.7
 
-    ``saw_home`` means we have seen the piece still on its origin with an empty
-    target, so a later occupied target is the piece arriving rather than the
-    arrowhead. An empty origin always means the piece has left.
+
+@dataclass
+class ArrowPulse:
+    """What the projector was showing while the current frame was exposed."""
+
+    lit: bool = False
+    on_since: float = 0.0
+    dark_skip: int = 0
+
+
+def step_arrow_pulse(pulse: ArrowPulse, *, active: bool, now: float, on_s: float = ARROW_ON_S) -> bool:
+    """Advance one captured frame. True when this frame was taken with the arrow off.
+
+    ``pulse.lit`` on entry is the projection during the exposure. On return it
+    is what to project next. The first dark frame is discarded.
     """
-    if origin_occupied and not dest_occupied:
-        saw_home = True
-    drop = (not origin_occupied) or (dest_occupied and saw_home)
-    return drop, saw_home
+    if not active:
+        pulse.lit = False
+        pulse.dark_skip = 0
+        return True
+    if pulse.lit:
+        if now - pulse.on_since >= on_s:
+            pulse.lit = False
+            pulse.dark_skip = 1
+        return False
+    if pulse.dark_skip > 0:
+        pulse.dark_skip -= 1
+        pulse.lit = False
+        return False
+    pulse.lit = True
+    pulse.on_since = now
+    return True
 
 
 def looks_like_chessboard(frame_bgr: np.ndarray, corners: np.ndarray | None = None) -> bool:
@@ -135,9 +161,7 @@ class ChessGameSession:
         self._lock_pending_quad: np.ndarray | None = None
         self._lock_pending_count = 0
         self._lock_frozen = False
-        self._arrow_hidden = False
-        self._arrow_home_clear = False
-        self._arrow_blind = 0
+        self._arrow = ArrowPulse()
         self._capture_moves = bool(getattr(cfg, "capture_moves", False))
         self._pending_still: tuple[str, str] | None = None
         self._vision_public: dict = {"fen": "", "phase": "", "colors": None, "pieces": []}
@@ -621,13 +645,10 @@ class ChessGameSession:
         promo_label = None
         if s.last_engine_promotion:
             promo_label = chess.piece_symbol(s.last_engine_promotion).upper()
-        # Hide the bot arrow once the piece has left home or landed on the target.
-        # The frame that decides that still contains the arrow, so scoring waits.
-        engine_arrow = None if s.is_human_turn() else s.last_engine_move
-        if self._awaiting_settle and not self._arrow_hidden:
+        # The arrow pulses. Frames exposed while it is lit are not scored.
+        engine_arrow = None
+        if self._awaiting_settle and self._arrow.lit and s.last_engine_move is not None:
             engine_arrow = s.last_engine_move
-        elif self._arrow_hidden:
-            engine_arrow = None
         scene = build_play_overlay(layout, engine_arrow, checks, revert, promo_label)
         # No filled chess grid during play (blackproj vision); keep outline for alignment.
         scene.project_chessboard = False
@@ -800,9 +821,9 @@ class ChessGameSession:
                 if isinstance(cam, MockCamera):
                     cam.set_occupancy(occupancy_from_board(s.board))
                 self._awaiting_settle = True
-                self._arrow_hidden = False
-                self._arrow_home_clear = False
-                self._arrow_blind = 0
+                self._arrow.lit = True
+                self._arrow.on_since = time.monotonic()
+                self._arrow.dark_skip = 0
                 self._reset_pending()
                 self._log_state("engine_played", uci=result.move.uci())
         except Exception as exc:  # noqa: BLE001 — keep session alive
@@ -876,31 +897,6 @@ class ChessGameSession:
             self._log_state("occ_candidate", uci=uci, label=label, mismatch=None)
             self._set_led(LedMode.BOT_TURN)
         return self._pending_count >= self._confirm_need
-
-    def _release_arrow(self, grid: np.ndarray) -> bool:
-        """Hide the arrow once the piece leaves home or reaches the target.
-
-        The exposure that shows this still has the arrow in it, so the caller
-        skips scoring. ``_arrow_blind`` skips the next still frame too, which
-        can still contain the light. A target that is occupied before we have
-        seen the piece at home with an empty target is the arrowhead, not a move.
-        """
-        move = self.session.last_engine_move
-        if move is None or not self._awaiting_settle or self._arrow_hidden:
-            return False
-        fr, fc = square_rc(move.from_square)
-        tr, tc = square_rc(move.to_square)
-        origin = bool(grid[fr, fc])
-        dest = bool(grid[tr, tc])
-        drop, self._arrow_home_clear = arrow_release(origin, dest, self._arrow_home_clear)
-        if not drop:
-            return False
-        self._arrow_hidden = True
-        self._arrow_blind = 1
-        square = chess.square_name(move.to_square if dest else move.from_square)
-        why = "occupied" if dest else "empty"
-        print(f"arrow off — {square} {why}, rechecking without the arrow")
-        return True
 
     def _confirm_fault(self, squares: list[chess.Square], reason: str) -> bool:
         # Square list jitters when YOLO flickers. Latch on the reason, not the squares.
@@ -982,25 +978,26 @@ class ChessGameSession:
         if self._calibration is None or s.phase != Phase.PLAY:
             return
         self._dbg_tick += 1
+        if self._awaiting_settle:
+            if not s.is_human_turn():
+                return
+            # Lit frames contain the arrowhead, which YOLO reads as a piece.
+            was_lit = self._arrow.lit
+            if not step_arrow_pulse(self._arrow, active=True, now=time.monotonic()):
+                if was_lit and not self._arrow.lit:
+                    print("arrow off — skipping one frame, then scoring")
+                return
+        else:
+            step_arrow_pulse(self._arrow, active=False, now=time.monotonic())
+
         observed = self._observe_board(frame_bgr, s.board)
         if observed is None:
             return
         occ, verdict = observed
 
         if self._awaiting_settle:
-            if not s.is_human_turn():
-                return
             # Bot just moved in software. Until the pieces leave the previous
             # position, a noisy grid must not become "the human replied".
-            if self._arrow_blind > 0:
-                self._arrow_blind -= 1
-                self._reset_pending()
-                return
-            # The arrow is a green line through the origin square. YOLO counts
-            # it as the piece that already left, so drop it before any verdict.
-            if self._release_arrow(occ.grid):
-                self._reset_pending()
-                return
             if occupancy_frame_is_noise(occ.grid, s.board, verdict):
                 return
             if self._physical_board_is_pre_engine(occ.grid):
