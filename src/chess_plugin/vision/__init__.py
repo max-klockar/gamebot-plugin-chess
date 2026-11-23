@@ -426,16 +426,15 @@ class BoardOccupancyDetector:
     ) -> OccupancyResult:
         """board_corners_px: 4x2 TL, TR, BR, BL in camera pixels — analysis is board-only.
 
-        Prefers piece YOLO (``pieces.onnx``) when present; classical texture is fallback.
+        When ``pieces.onnx`` is present, YOLO is authoritative — including 0 pieces
+        (means “not set up yet”). Classical texture is only used if YOLO weights
+        are missing (it over-fires and must not override a real 0).
         """
         if prefer_yolo:
             yolo = occupancy_from_yolo_pieces(frame_bgr, board_corners_px)
-            if yolo is not None and int(yolo.grid.sum()) >= 8:
-                return yolo
             if yolo is not None:
-                print(
-                    f"occupancy yolo weak ({int(yolo.grid.sum())} pcs) — trying classical"
-                )
+                return yolo
+            print("occupancy: pieces.onnx missing — classical fallback (legacy)")
         warped = warp_board(frame_bgr, board_corners_px, out_size=400)
         if empty_reference is None and self.empty_reference is None:
             if self.ensure_empty_reference(warped):
@@ -590,7 +589,7 @@ def occupancy_from_yolo_pieces(
     frame_bgr: np.ndarray,
     board_corners_px: np.ndarray,
     *,
-    conf: float = 0.25,
+    conf: float = 0.15,
 ) -> OccupancyResult | None:
     """Piece YOLO → 8×8 occupancy (+ white/black colours). None if weights missing."""
     try:
@@ -603,9 +602,11 @@ def occupancy_from_yolo_pieces(
     grid = np.zeros((8, 8), dtype=bool)
     conf_g = np.zeros((8, 8), dtype=np.float64)
     colors = np.full((8, 8), -1, dtype=np.int8)
+    off_board = 0
     for d in dets:
         rc = camera_xy_to_board_rc(d.xy, board_corners_px)
         if rc is None:
+            off_board += 1
             continue
         r, c = rc
         # Keep highest-confidence piece if two map to same square.
@@ -617,7 +618,11 @@ def occupancy_from_yolo_pieces(
     warped = warp_board(frame_bgr, board_corners_px, out_size=400)
     n_w = int(np.count_nonzero(colors == CLASS_WHITE))
     n_b = int(np.count_nonzero(colors == CLASS_BLACK))
-    print(f"occupancy yolo: {int(grid.sum())} pieces (white={n_w} black={n_b})")
+    extra = f", {off_board} off-board" if off_board else ""
+    print(
+        f"occupancy yolo: {int(grid.sum())} on-board "
+        f"(white={n_w} black={n_b}, raw_boxes={len(dets)}{extra})"
+    )
     return OccupancyResult(
         grid=grid, confidence=conf_g, warped_bgr=warped, method="yolo", colors=colors
     )
