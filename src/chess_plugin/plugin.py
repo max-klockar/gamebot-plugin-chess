@@ -100,6 +100,7 @@ class ChessGameSession:
         self._settle_frames = 0
         self._settle_saw_motion = False
         self._settle_baseline: np.ndarray | None = None
+        self._settle_unclear_rounds = 0
         self._fault_baseline: np.ndarray | None = None
         self._fault_clear_frames = 0
         self._pending_uci: str | None = None
@@ -107,10 +108,11 @@ class ChessGameSession:
         self._pending_fault = 0
         self._dbg_tick = 0
         self._exit = False
-        # Settle / fault patience (frames @ ~camera rate).
-        self._settle_still_frames = 35
-        self._fault_confirm_frames = 28
-        self._fault_clear_need = 18
+        # Snappy settle; unclear states get a few quick re-checks before soft fault.
+        self._settle_still_frames = 12
+        self._settle_unclear_limit = 5
+        self._fault_confirm_frames = 12
+        self._fault_clear_need = 10
         self._camera = getattr(runtime, "camera", None)
         self._calibration = getattr(runtime, "calibration", None)
         self._setup_ready_frames = 0
@@ -650,6 +652,7 @@ class ChessGameSession:
             self._awaiting_settle = True
             self._settle_frames = 0
             self._settle_saw_motion = False
+            self._settle_unclear_rounds = 0
             self._pending_uci = None
             self._pending_count = 0
             self._pending_fault = 0
@@ -675,20 +678,45 @@ class ChessGameSession:
         self._awaiting_settle = True
         self._settle_frames = 0
 
-    def _keep_waiting_settle(self, baseline: np.ndarray, why: str) -> None:
-        """Stay in bot-place settle — never fault mid-hand."""
-        print(f"{why} — still waiting for a clean settle…")
-        self._settle_baseline = baseline.copy()
-        self._awaiting_settle = True
-        self._settle_frames = 0
-        # Keep saw_motion so we only need more stillness, not another wave.
-        self._settle_saw_motion = True
-        self._set_led(LedMode.BOT_TURN)
+    def _keep_waiting_settle(
+        self,
+        baseline: np.ndarray,
+        why: str,
+        *,
+        gray: np.ndarray | None = None,
+        residual_flat: list | None = None,
+    ) -> None:
+        """Unclear settle → quick re-check loop; soft-fault only after several rounds."""
+        self._settle_unclear_rounds += 1
+        round_n = self._settle_unclear_rounds
+        limit = self._settle_unclear_limit
+        if round_n < limit:
+            print(f"{why} — re-check {round_n}/{limit}")
+            self._settle_baseline = baseline.copy()
+            self._awaiting_settle = True
+            self._settle_frames = 0
+            self._settle_saw_motion = True
+            self._set_led(LedMode.BOT_TURN)
+            return
+
+        # Still weird after a few clean looks → soft fault + highlight.
+        r0 = c0 = r1 = c1 = 0
+        if residual_flat and len(residual_flat) >= 2:
+            r0, c0 = residual_flat[0][1], residual_flat[0][2]
+            r1, c1 = residual_flat[1][1], residual_flat[1][2]
+        s = self.session
+        s.enter_fault(chess.square(c0, 7 - r0), chess.square(c1, 7 - r1), "unexpected")
+        self._awaiting_settle = False
+        self._settle_baseline = None
+        self._settle_unclear_rounds = 0
+        self._enter_fault(why, baseline=baseline)
+        if gray is not None:
+            self._last_gray = gray
 
     def _finish_bot_settle(self, gray: np.ndarray) -> None:
         """After bot arrow: A = only bot piece, B = bot + human reply in one motion.
 
-        Mid-hand / ambiguous diffs just wait longer — never enter FAULT here.
+        Unclear diffs re-check a few times (fast); only then soft-fault.
         """
         s = self.session
         baseline = self._settle_baseline if self._settle_baseline is not None else self._prev_warped
@@ -700,6 +728,7 @@ class ChessGameSession:
         if baseline is None or engine_move is None or not s.is_human_turn():
             self._awaiting_settle = False
             self._settle_baseline = None
+            self._settle_unclear_rounds = 0
             self._prev_warped = gray.copy()
             if s.is_human_turn():
                 s.last_engine_move = None
@@ -733,6 +762,7 @@ class ChessGameSession:
             if s.try_human_move(best.move):
                 self._awaiting_settle = False
                 self._settle_baseline = None
+                self._settle_unclear_rounds = 0
                 print(f"board settled — bot placed + your {best.move.uci()} (combo)")
                 s.last_engine_move = None
                 s.last_engine_promotion = None
@@ -740,9 +770,9 @@ class ChessGameSession:
                 self._sync_turn_led()
                 return
             if s.phase == Phase.FAULT:
-                # Illegal reply while placing — soft fault, keep good baseline.
                 self._awaiting_settle = False
                 self._settle_baseline = None
+                self._settle_unclear_rounds = 0
                 self._enter_fault(
                     s.revert_hint.reason if s.revert_hint else "illegal",
                     baseline=baseline,
@@ -753,6 +783,7 @@ class ChessGameSession:
         if bot_e >= 14.0 and top_residual < 28.0:
             self._awaiting_settle = False
             self._settle_baseline = None
+            self._settle_unclear_rounds = 0
             s.last_engine_move = None
             s.last_engine_promotion = None
             self._prev_warped = gray.copy()
@@ -760,15 +791,13 @@ class ChessGameSession:
             self._set_led(LedMode.PLAYER_TURN)
             return
 
-        if bot_e < 12.0 and top_residual < 20.0:
-            self._keep_waiting_settle(baseline, "bot piece not clearly placed yet")
-            return
-
-        # Hand still in frame / half-move — chill and look again after more stillness.
-        self._keep_waiting_settle(
-            baseline,
-            f"settle unclear (bot_e={bot_e:.0f} residual={top_residual:.0f})",
+        # Not placed yet, or hand mid-move — re-check a few rounds before alerting.
+        why = (
+            "bot piece not clearly placed yet"
+            if bot_e < 12.0 and top_residual < 20.0
+            else f"settle unclear (bot_e={bot_e:.0f} residual={top_residual:.0f})"
         )
+        self._keep_waiting_settle(baseline, why, gray=gray, residual_flat=flat)
 
     def _poll_fault_recover(self, frame_bgr: np.ndarray) -> None:
         """Keep watching during FAULT; auto-clear when the board matches again (or a legal move)."""
