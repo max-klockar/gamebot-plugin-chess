@@ -316,12 +316,12 @@ class ChessGameSession:
 
         found = detect_human_is_white(frame, cal.board_corners_camera)
         if found is None:
-            # Last resort: bottom-of-image army brighter → human white (same geometry).
-            print("setup: side still inconclusive — default human=white (white near you)")
-            self.session.human_is_white = True
+            # Do NOT default to human=white — that is what assigned white to the
+            # player while the white army sat on the bot side (see Pi log).
+            print("setup: side inconclusive — leaving quick-start colour; check piece colours")
             self._capture_empty_reference(frame)
             self._prev_warped = self._snapshot_board_gray(frame)
-            return True
+            return bool(self.session.human_is_white)
         self.session.human_is_white = found
         print(
             f"side detect: you={'white' if found else 'black'} "

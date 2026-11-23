@@ -280,8 +280,8 @@ def setup_from_corner_pieces(
 ) -> CornerPieceSetup | None:
     """One white corner piece is enough for colour (+ optional snap of board pose).
 
-    Board quad is TL,TR,BR,BL in camera pixels: bottom edge = human side of the
-    table. White nearer that edge ⇒ human plays white (goes first).
+    Board quad TL,TR,BR,BL: bottom edge (BR–BL) is the bot/machine side of the
+    table; top is the human. White nearer the bottom ⇒ bot is white.
     """
     roi = search_roi if search_roi is not None else existing_board
     pair = detect_white_black_pieces(frame_bgr, search_roi=roi)
@@ -299,16 +299,16 @@ def setup_from_corner_pieces(
             return None
         board = force_square_quad(snap_board_to_white_corner(white_xy, existing_board))
 
-    human_mid = 0.5 * (board[2] + board[3])  # BR+BL = bottom of camera
-    bot_mid = 0.5 * (board[0] + board[1])  # TR+TL = top of camera
+    bot_mid = 0.5 * (board[2] + board[3])  # BR+BL = bottom of camera = bot
+    human_mid = 0.5 * (board[0] + board[1])  # TL+TR = top = human
     white = np.asarray(white_xy, dtype=np.float64)
-    human_is_white = float(np.linalg.norm(white - human_mid)) <= float(np.linalg.norm(white - bot_mid))
+    bot_is_white = float(np.linalg.norm(white - bot_mid)) <= float(np.linalg.norm(white - human_mid))
     return CornerPieceSetup(
         white_xy=white_xy,
         black_xy=black_xy,
         board_corners_px=board,
-        human_is_white=human_is_white,
-        bot_is_white=not human_is_white,
+        human_is_white=not bot_is_white,
+        bot_is_white=bot_is_white,
     )
 
 
@@ -479,8 +479,8 @@ def detect_human_is_white(
 ) -> bool | None:
     """Infer whether the human plays white from the starting armies.
 
-    Warps TL→top-left … BL→bottom-left. Bottom ranks (rows 6–7) are the human
-    side of the table; top (0–1) is the bot. Lighter army = white.
+    Warps TL→top-left … BL→bottom-left. Bottom ranks (rows 6–7) are the
+    bot/machine side of the table; top (0–1) is the human. Lighter army = white.
     """
     warped = warp_board(frame_bgr, board_corners_px, out_size=400)
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
@@ -500,19 +500,37 @@ def detect_human_is_white(
                 vals.append(float(patch.mean()))
         return vals
 
-    human_side = rank_piece_brightness(range(6, 8))  # bottom of camera = human
-    bot_side = rank_piece_brightness(range(0, 2))  # top = bot
-    if len(human_side) < 4 or len(bot_side) < 4:
+    bot_side = rank_piece_brightness(range(6, 8))  # bottom of camera = bot
+    human_side = rank_piece_brightness(range(0, 2))  # top = human
+
+    def rank_mean(rows: range) -> float:
+        vals: list[float] = []
+        for r in rows:
+            for c in range(8):
+                y0, x0 = r * sq, c * sq
+                patch = gray[y0 + 6 : y0 + sq - 6, x0 + 6 : x0 + sq - 6]
+                if patch.size:
+                    vals.append(float(patch.mean()))
+        return float(np.mean(vals)) if vals else 0.0
+
+    if len(human_side) >= 4 and len(bot_side) >= 4:
+        human_m = float(np.mean(human_side))
+        bot_m = float(np.mean(bot_side))
+        source = "pieces"
+    else:
+        # Whole-rank means still skew toward the white army; better than guessing.
+        human_m = rank_mean(range(0, 2))
+        bot_m = rank_mean(range(6, 8))
+        source = "rank-mean"
         print(
-            f"side detect: not enough piece samples "
-            f"(human_side={len(human_side)} bot_side={len(bot_side)})"
+            f"side detect: sparse piece samples "
+            f"(human={len(human_side)} bot={len(bot_side)}) — using {source}"
         )
-        return None
-    human_m = float(np.mean(human_side))
-    bot_m = float(np.mean(bot_side))
-    gap = human_m - bot_m
-    print(f"side detect: human_side_bright≈{human_m:.0f} bot_side_bright≈{bot_m:.0f} gap≈{gap:.0f}")
-    # Always pick the brighter army as white when we have samples; tiny gaps only.
+    gap = human_m - bot_m  # >0 → human army brighter → human white
+    print(
+        f"side detect ({source}): human_side_bright≈{human_m:.0f} "
+        f"bot_side_bright≈{bot_m:.0f} gap≈{gap:.0f}"
+    )
     if abs(gap) < 4.0:
         return None
     return gap > 0.0
