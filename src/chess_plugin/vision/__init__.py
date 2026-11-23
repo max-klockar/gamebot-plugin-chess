@@ -817,15 +817,18 @@ def occupancy_frame_is_noise(
     board: chess.Board,
     verdict: OccupancyVerdict,
 ) -> bool:
-    """Extra boxes or a one-square flicker. Not a move and not a fault.
+    """Detector garbage, or a one-square flicker. Not a move and not a fault.
 
-    A legal move never adds a piece. One stray detection (33 on a full board)
-    used to enter FAULT and then clear on the next sloppy match.
+    A move changes the piece count by at most one. Thirteen pieces on a full
+    board is a failed detect: ignore the frame, and do not enter or leave FAULT
+    because of it. One extra box (33 vs 32) is the same — it must not strobe red.
     """
-    if verdict.kind in (OccupancyKind.MATCH, OccupancyKind.ONE_LEGAL):
-        return False
     seen_n = int(np.asarray(seen, dtype=bool).sum())
     expected_n = int(occupancy_from_board(board).sum())
+    if abs(seen_n - expected_n) > 2:
+        return True
+    if verdict.kind in (OccupancyKind.MATCH, OccupancyKind.ONE_LEGAL):
+        return False
     if seen_n > expected_n:
         return True
     return verdict.mismatch <= 1

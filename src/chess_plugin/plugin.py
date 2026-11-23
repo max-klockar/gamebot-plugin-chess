@@ -33,6 +33,7 @@ from chess_plugin.vision import (
     occupancy_from_board,
     occupancy_mismatch,
     setup_from_corner_pieces,
+    square_rc,
     warp_board,
 )
 from gamebot.adapters.camera import MockCamera
@@ -121,6 +122,7 @@ class ChessGameSession:
         self._lock_pending_quad: np.ndarray | None = None
         self._lock_pending_count = 0
         self._lock_frozen = False
+        self._arrow_hidden = False
 
     def _set_led(self, mode: LedMode) -> None:
         led = getattr(self.runtime, "led", None)
@@ -555,10 +557,13 @@ class ChessGameSession:
         promo_label = None
         if s.last_engine_promotion:
             promo_label = chess.piece_symbol(s.last_engine_promotion).upper()
-        # Hide bot arrow once the piece should already be placed (human's turn).
+        # Hide bot arrow once the piece should already be placed (human's turn),
+        # or as soon as its origin square is empty.
         engine_arrow = None if s.is_human_turn() else s.last_engine_move
-        if self._awaiting_settle:
+        if self._awaiting_settle and not self._arrow_hidden:
             engine_arrow = s.last_engine_move
+        elif self._arrow_hidden:
+            engine_arrow = None
         scene = build_play_overlay(layout, engine_arrow, checks, revert, promo_label)
         # No filled chess grid during play (blackproj vision); keep outline for alignment.
         scene.project_chessboard = False
@@ -725,6 +730,7 @@ class ChessGameSession:
                 if isinstance(cam, MockCamera):
                     cam.set_occupancy(occupancy_from_board(s.board))
                 self._awaiting_settle = True
+                self._arrow_hidden = False
                 self._reset_pending()
                 self._log_state("engine_played", uci=result.move.uci())
         except Exception as exc:  # noqa: BLE001 — keep session alive
@@ -794,8 +800,20 @@ class ChessGameSession:
             self._set_led(LedMode.BOT_TURN)
         return self._pending_count >= self._confirm_need
 
+    def _note_engine_piece_left(self, grid: np.ndarray) -> None:
+        """Drop the arrow once the bot piece is no longer on its origin square."""
+        move = self.session.last_engine_move
+        if move is None or not self._awaiting_settle or self._arrow_hidden:
+            return
+        r, c = square_rc(move.from_square)
+        if bool(grid[r, c]):
+            return
+        self._arrow_hidden = True
+        print(f"arrow off — {chess.square_name(move.from_square)} empty")
+
     def _confirm_fault(self, squares: list[chess.Square], reason: str) -> bool:
-        key = reason + ":" + ",".join(chess.square_name(sq) for sq in squares[:6])
+        # Square list jitters when YOLO flickers. Latch on the reason, not the squares.
+        key = reason
         self._pending_uci = None
         self._pending_count = 0
         if key == self._pending_fault_key:
@@ -843,7 +861,6 @@ class ChessGameSession:
             return
         occ, verdict = observed
         if occupancy_frame_is_noise(occ.grid, s.board, verdict):
-            self._fault_clear_count = 0
             return
         if verdict.kind == OccupancyKind.MATCH:
             self._fault_clear_count += 1
@@ -884,12 +901,11 @@ class ChessGameSession:
                 return
             # Bot just moved in software. Until the pieces leave the previous
             # position, a noisy grid must not become "the human replied".
+            if occupancy_frame_is_noise(occ.grid, s.board, verdict):
+                return
+            self._note_engine_piece_left(occ.grid)
             if self._physical_board_is_pre_engine(occ.grid):
                 self._reset_pending()
-                return
-            if occupancy_frame_is_noise(occ.grid, s.board, verdict):
-                self._pending_fault_key = None
-                self._pending_fault_count = 0
                 return
             if self._dbg_tick % 30 == 0:
                 print(
@@ -929,8 +945,6 @@ class ChessGameSession:
             return
 
         if occupancy_frame_is_noise(occ.grid, s.board, verdict):
-            self._pending_fault_key = None
-            self._pending_fault_count = 0
             return
 
         if verdict.kind == OccupancyKind.MATCH:
