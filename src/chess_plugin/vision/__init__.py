@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 import chess
 import cv2
@@ -22,6 +23,20 @@ class OccupancyResult:
 class MoveHypothesis:
     move: chess.Move
     score: float
+
+
+class OccupancyKind(str, Enum):
+    MATCH = "match"
+    ONE_LEGAL = "one_legal"
+    ILLEGAL_OR_MULTI = "illegal_or_multi"
+
+
+@dataclass
+class OccupancyVerdict:
+    kind: OccupancyKind
+    mismatch: int
+    move: chess.Move | None = None
+    changed_squares: list[chess.Square] = field(default_factory=list)
 
 
 @dataclass
@@ -738,27 +753,77 @@ def looks_like_starting_occupancy(
     return back >= 24 and mid <= 8
 
 
+def _idx_to_square(r: int, c: int) -> chess.Square:
+    return chess.square(c, 7 - r)
+
+
+def changed_squares(before: np.ndarray, after: np.ndarray) -> list[chess.Square]:
+    """Squares whose occupied/empty bit differs between two grids."""
+    a = np.asarray(before, dtype=bool)
+    b = np.asarray(after, dtype=bool)
+    out: list[chess.Square] = []
+    for r, c in np.argwhere(a != b):
+        out.append(_idx_to_square(int(r), int(c)))
+    return out
+
+
+def classify_occupancy_vs_board(
+    seen: np.ndarray,
+    board: chess.Board,
+    *,
+    match_slop: int = 0,
+) -> OccupancyVerdict:
+    """Compare YOLO/classical occupancy to the software board.
+
+    - match: seen ≈ expected (unchanged)
+    - one_legal: delta is exactly one legal move
+    - illegal_or_multi: anything else (wrong change or too many changes)
+    """
+    expected = occupancy_from_board(board)
+    seen_b = np.asarray(seen, dtype=bool)
+    miss = occupancy_mismatch(seen_b, expected)
+    changed = changed_squares(expected, seen_b)
+    if miss <= match_slop:
+        return OccupancyVerdict(OccupancyKind.MATCH, miss, None, changed)
+
+    hyps = hypothesize_moves(expected, seen_b, board)
+    # Prefer a single unambiguous legal interpretation.
+    if len(hyps) == 1:
+        return OccupancyVerdict(OccupancyKind.ONE_LEGAL, miss, hyps[0].move, changed)
+    # Several promo choices for the same from/to → still one move (UI picks piece).
+    if len(hyps) > 1:
+        bases = {(h.move.from_square, h.move.to_square) for h in hyps}
+        if len(bases) == 1 and all(h.move.promotion for h in hyps):
+            src, dst = next(iter(bases))
+            return OccupancyVerdict(
+                OccupancyKind.ONE_LEGAL,
+                miss,
+                chess.Move(src, dst),
+                changed,
+            )
+    return OccupancyVerdict(OccupancyKind.ILLEGAL_OR_MULTI, miss, None, changed)
+
+
 def hypothesize_moves(
     before: np.ndarray,
     after: np.ndarray,
     board: chess.Board,
 ) -> list[MoveHypothesis]:
     """Match occupancy delta to legal moves."""
-    vacated = np.argwhere(before & ~after)
-    filled = np.argwhere(~before & after)
-
-    def idx_to_square(r: int, c: int) -> chess.Square:
-        return chess.square(c, 7 - r)
+    before_b = np.asarray(before, dtype=bool)
+    after_b = np.asarray(after, dtype=bool)
+    vacated = np.argwhere(before_b & ~after_b)
+    filled = np.argwhere(~before_b & after_b)
 
     candidates: list[MoveHypothesis] = []
     legal = list(board.legal_moves)
 
-    # Standard: one vacated, one filled
+    # Standard / promotion: one vacated, one filled
     if len(vacated) == 1 and len(filled) == 1:
         fr, fc = vacated[0]
         tr, tc = filled[0]
-        src = idx_to_square(int(fr), int(fc))
-        dst = idx_to_square(int(tr), int(tc))
+        src = _idx_to_square(int(fr), int(fc))
+        dst = _idx_to_square(int(tr), int(tc))
         for m in legal:
             if m.from_square == src and m.to_square == dst:
                 candidates.append(MoveHypothesis(m, 1.0))
@@ -766,20 +831,37 @@ def hypothesize_moves(
     # Capture: vacated origin, destination stayed occupied
     if len(vacated) == 1 and len(filled) == 0:
         fr, fc = vacated[0]
-        src = idx_to_square(int(fr), int(fc))
+        src = _idx_to_square(int(fr), int(fc))
         for m in legal:
-            if m.from_square == src and board.is_capture(m):
-                # Destination should still be occupied
+            if m.from_square == src and board.is_capture(m) and not board.is_en_passant(m):
                 dr = 7 - chess.square_rank(m.to_square)
                 dc = chess.square_file(m.to_square)
-                if after[dr, dc]:
+                if after_b[dr, dc]:
                     candidates.append(MoveHypothesis(m, 0.9))
+
+    # En passant: vacated from + captured pawn, filled destination
+    if len(vacated) == 2 and len(filled) == 1:
+        for m in legal:
+            if not board.is_en_passant(m):
+                continue
+            cap = chess.square(chess.square_file(m.to_square), chess.square_rank(m.from_square))
+            vac = {_idx_to_square(int(r), int(c)) for r, c in vacated}
+            fill = _idx_to_square(int(filled[0][0]), int(filled[0][1]))
+            if vac == {m.from_square, cap} and fill == m.to_square:
+                candidates.append(MoveHypothesis(m, 0.92))
 
     # Castling: king and rook both move — two vacated, two filled
     if len(vacated) == 2 and len(filled) == 2:
+        vac = {_idx_to_square(int(r), int(c)) for r, c in vacated}
+        fill = {_idx_to_square(int(r), int(c)) for r, c in filled}
         for m in legal:
-            if board.is_castling(m):
+            if not board.is_castling(m):
+                continue
+            touched = set(squares_affected_by_move(board, m))
+            if vac | fill == touched and vac.isdisjoint(fill):
                 candidates.append(MoveHypothesis(m, 0.95))
+            elif m.from_square in vac and m.to_square in fill:
+                candidates.append(MoveHypothesis(m, 0.9))
 
     candidates.sort(key=lambda h: h.score, reverse=True)
     # Deduplicate by UCI
