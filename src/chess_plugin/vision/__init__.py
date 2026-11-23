@@ -17,6 +17,8 @@ class OccupancyResult:
     warped_bgr: np.ndarray | None = None
     method: str = "classical"
     colors: np.ndarray | None = None  # 8x8 int8: -1 empty, 0 white, 1 black (YOLO)
+    # Camera-frame boxes: x1,y1,x2,y2, standing x,y, class, conf.
+    pieces: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -639,8 +641,26 @@ def occupancy_from_yolo_pieces(
     if same_square:
         extra += f", {same_square} same-square"
     _log_yolo_occupancy(int(grid.sum()), n_w, n_b, len(dets), extra)
+    pieces = [
+        {
+            "x1": d.xyxy[0],
+            "y1": d.xyxy[1],
+            "x2": d.xyxy[2],
+            "y2": d.xyxy[3],
+            "x": d.xy[0],
+            "y": d.xy[1],
+            "cls": int(d.cls),
+            "conf": float(d.conf),
+        }
+        for d in dets
+    ]
     return OccupancyResult(
-        grid=grid, confidence=conf_g, warped_bgr=warped, method="yolo", colors=colors
+        grid=grid,
+        confidence=conf_g,
+        warped_bgr=warped,
+        method="yolo",
+        colors=colors,
+        pieces=pieces,
     )
 
 

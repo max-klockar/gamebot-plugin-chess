@@ -125,6 +125,7 @@ class ChessGameSession:
         self._arrow_hidden = False
         self._capture_moves = bool(getattr(cfg, "capture_moves", False))
         self._pending_still: tuple[str, str] | None = None
+        self._vision_public: dict = {"fen": "", "phase": "", "colors": None, "pieces": []}
 
     def _set_led(self, mode: LedMode) -> None:
         led = getattr(self.runtime, "led", None)
@@ -242,11 +243,32 @@ class ChessGameSession:
             return self._last_good_quad
         return cal.board_corners_camera
 
+    def vision_snapshot(self) -> dict:
+        """Last occupancy the operator page draws. Plain data, no arrays."""
+        return self._vision_public
+
+    def _publish_vision(self, occ) -> None:
+        colors = None
+        if occ.colors is not None:
+            colors = np.asarray(occ.colors, dtype=int).tolist()
+        elif occ.grid is not None:
+            g = np.asarray(occ.grid, dtype=bool)
+            colors = [[2 if g[r, c] else -1 for c in range(8)] for r in range(8)]
+        self._vision_public = {
+            "fen": self.session.board.fen(),
+            "phase": self.session.phase.name,
+            "colors": colors,
+            "pieces": list(occ.pieces or []),
+        }
+
     def _read_occupancy(self, frame_bgr: np.ndarray):
         roi = self._board_roi()
         if roi is None:
             return None
-        return self.occupancy.detect(frame_bgr, roi, prefer_yolo=True)
+        occ = self.occupancy.detect(frame_bgr, roi, prefer_yolo=True)
+        if occ is not None:
+            self._publish_vision(occ)
+        return occ
 
     def _sync_turn_led(self) -> None:
         s = self.session
@@ -702,6 +724,7 @@ class ChessGameSession:
 
         roi = self._last_good_quad if self._last_good_quad is not None else cal.board_corners_camera
         occ = self.occupancy.detect(frame_bgr, roi, prefer_yolo=True)
+        self._publish_vision(occ)
         ready = looks_like_starting_occupancy(occ.grid)
         summary = occupancy_debug_summary(occ.grid, method=occ.method, colors=occ.colors)
         # Regular piece-count debug so we can see why setup is stuck.
