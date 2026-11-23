@@ -615,6 +615,7 @@ def occupancy_from_yolo_pieces(
     conf_g = np.zeros((8, 8), dtype=np.float64)
     colors = np.full((8, 8), -1, dtype=np.int8)
     off_board = 0
+    same_square = 0
     for d in dets:
         rc = camera_xy_to_board_rc(d.xy, board_corners_px)
         if rc is None:
@@ -622,15 +623,21 @@ def occupancy_from_yolo_pieces(
             continue
         r, c = rc
         # Keep highest-confidence piece if two map to same square.
-        if grid[r, c] and conf_g[r, c] >= d.conf:
-            continue
+        if grid[r, c]:
+            same_square += 1
+            if conf_g[r, c] >= d.conf:
+                continue
         grid[r, c] = True
         conf_g[r, c] = d.conf
         colors[r, c] = CLASS_WHITE if d.cls == CLASS_WHITE else CLASS_BLACK
     warped = warp_board(frame_bgr, board_corners_px, out_size=400)
     n_w = int(np.count_nonzero(colors == CLASS_WHITE))
     n_b = int(np.count_nonzero(colors == CLASS_BLACK))
-    extra = f", {off_board} off-board" if off_board else ""
+    extra = ""
+    if off_board:
+        extra += f", {off_board} off-board"
+    if same_square:
+        extra += f", {same_square} same-square"
     _log_yolo_occupancy(int(grid.sum()), n_w, n_b, len(dets), extra)
     return OccupancyResult(
         grid=grid, confidence=conf_g, warped_bgr=warped, method="yolo", colors=colors

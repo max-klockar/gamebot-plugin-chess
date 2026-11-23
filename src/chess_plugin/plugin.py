@@ -123,6 +123,8 @@ class ChessGameSession:
         self._lock_pending_count = 0
         self._lock_frozen = False
         self._arrow_hidden = False
+        self._capture_moves = bool(getattr(cfg, "capture_moves", False))
+        self._pending_still: tuple[str, str] | None = None
 
     def _set_led(self, mode: LedMode) -> None:
         led = getattr(self.runtime, "led", None)
@@ -169,6 +171,31 @@ class ChessGameSession:
             f"state: {event} | {s.phase.name} {whose} FEN={s.board.board_fen()} "
             f"settle={self._awaiting_settle} eng={payload['last_engine']}"
         )
+
+    def _save_move_still(self, frame_bgr: np.ndarray, *, who: str, uci: str) -> None:
+        """Keep the confirming camera frame. Training pull already copies 04_play."""
+        if not self._capture_moves:
+            return
+        from gamebot.capture_frames import save_move_still
+
+        roi = self._board_roi()
+        corners = None if roi is None else np.asarray(roi, dtype=float).reshape(-1, 2).tolist()
+        zoom = float(getattr(self.runtime.config, "camera_zoom", 1.2))
+        out = Path(self.runtime.data_dir) / "captures" / "sets" / "04_play"
+        try:
+            path = save_move_still(
+                frame_bgr,
+                out,
+                uci=uci,
+                who=who,
+                fen=self.session.board.fen(),
+                camera_zoom=zoom,
+                board_corners_camera=corners,
+            )
+        except (OSError, RuntimeError) as exc:
+            print(f"move capture failed: {exc}")
+            return
+        print(f"captured {who} {uci} → {path}")
 
     def _enter_fault(self, reason: str, squares: list[chess.Square] | None = None) -> None:
         print(f"FAULT — {reason} (waiting until board matches again)")
@@ -610,7 +637,8 @@ class ChessGameSession:
             self._seed_lock_from_calibration()
             return
         if zone_id.startswith("promo:"):
-            s.confirm_promotion(int(zone_id.split(":", 1)[1]))
+            if s.confirm_promotion(int(zone_id.split(":", 1)[1])) and s.board.move_stack:
+                self._pending_still = ("human", s.board.move_stack[-1].uci())
             self._awaiting_settle = True
             self._reset_pending()
             return
@@ -641,6 +669,10 @@ class ChessGameSession:
             return
         if s.phase != Phase.PLAY:
             return
+        if self._pending_still is not None:
+            who, uci = self._pending_still
+            self._pending_still = None
+            self._save_move_still(frame_bgr, who=who, uci=uci)
         self._sync_turn_led()
         if self._awaiting_settle or s.is_human_turn():
             self._poll_board_move(frame_bgr)
@@ -757,8 +789,9 @@ class ChessGameSession:
         self._awaiting_settle = True
         self._reset_pending()
 
-    def _hand_to_player_after_bot(self) -> None:
+    def _hand_to_player_after_bot(self, frame_bgr: np.ndarray) -> None:
         s = self.session
+        uci = s.last_engine_move.uci() if s.last_engine_move else "settle"
         self._awaiting_settle = False
         s.last_engine_move = None
         s.last_engine_promotion = None
@@ -766,8 +799,9 @@ class ChessGameSession:
         print("board settled — your move")
         self._set_led(LedMode.PLAYER_TURN)
         self._log_state("settle_player_turn")
+        self._save_move_still(frame_bgr, who="bot", uci=uci)
 
-    def _apply_confirmed_human(self, move: chess.Move, *, source: str) -> None:
+    def _apply_confirmed_human(self, move: chess.Move, frame_bgr: np.ndarray, *, source: str) -> None:
         s = self.session
         uci = move.uci()
         if s.try_human_move(move):
@@ -778,6 +812,9 @@ class ChessGameSession:
             self._reset_pending()
             self._sync_turn_led()
             self._log_state("human_move", uci=uci, source=source)
+            if s.phase == Phase.PLAY:
+                applied = s.board.move_stack[-1].uci() if s.board.move_stack else uci
+                self._save_move_still(frame_bgr, who="human", uci=applied)
             cam = self._camera
             if isinstance(cam, MockCamera):
                 cam.set_occupancy(occupancy_from_board(s.board))
@@ -871,7 +908,7 @@ class ChessGameSession:
         if verdict.kind == OccupancyKind.ONE_LEGAL and verdict.move is not None:
             if self._confirm_legal(verdict.move, label="fault_recover"):
                 s.phase = Phase.PLAY
-                self._apply_confirmed_human(verdict.move, source="fault_recover")
+                self._apply_confirmed_human(verdict.move, frame_bgr, source="fault_recover")
             return
         if self._dbg_tick % 40 == 0:
             print(
@@ -922,11 +959,11 @@ class ChessGameSession:
                 else:
                     self._pending_count += 1
                 if self._pending_count >= self._confirm_need:
-                    self._hand_to_player_after_bot()
+                    self._hand_to_player_after_bot(frame_bgr)
                 return
             if verdict.kind == OccupancyKind.ONE_LEGAL and verdict.move is not None:
                 if self._confirm_legal(verdict.move, label="settle_combo"):
-                    self._apply_confirmed_human(verdict.move, source="settle_combo")
+                    self._apply_confirmed_human(verdict.move, frame_bgr, source="settle_combo")
                 return
             if verdict.mismatch >= 3 and self._confirm_fault(
                 verdict.changed_squares, "unexpected_while_placing"
@@ -954,7 +991,7 @@ class ChessGameSession:
         changed_names = [chess.square_name(sq) for sq in verdict.changed_squares]
         if verdict.kind == OccupancyKind.ONE_LEGAL and verdict.move is not None:
             if self._confirm_legal(verdict.move, label="human"):
-                self._apply_confirmed_human(verdict.move, source="occupancy")
+                self._apply_confirmed_human(verdict.move, frame_bgr, source="occupancy")
             else:
                 self._log_state(
                     "occ_pending",
