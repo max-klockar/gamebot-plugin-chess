@@ -70,8 +70,8 @@ def build_play_overlay(
     if engine_move is not None:
         x0, y0 = layout.square_center(engine_move.from_square)
         x1, y1 = layout.square_center(engine_move.to_square)
-        # Bright blue (BGR) — readable on the blue board under the projector
-        scene.add_arrow(x0, y0, x1, y1, (255, 140, 20))
+        # Sharp green (BGR) — high contrast on the board under the projector
+        scene.add_arrow(x0, y0, x1, y1, (0, 255, 60))
     for a, b in check_pairs:
         x0, y0 = layout.square_center(a)
         x1, y1 = layout.square_center(b)
