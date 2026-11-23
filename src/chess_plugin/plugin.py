@@ -19,6 +19,7 @@ from chess_plugin.vision import (
     BoardOccupancyDetector,
     detect_human_is_white,
     hypothesize_moves_from_diff,
+    detect_human_is_white_from_colors,
     looks_like_starting_occupancy,
     occupancy_debug_summary,
     occupancy_from_board,
@@ -291,11 +292,25 @@ class ChessGameSession:
 
         locked = self._lock_physical_board(frame)
         roi = locked if locked is not None else cal.board_corners_camera
+
+        # Prefer YOLO white/black counts on each side of the board.
+        occ = self.occupancy.detect(frame, roi, prefer_yolo=True)
+        if occ.colors is not None:
+            found = detect_human_is_white_from_colors(occ.colors)
+            if found is not None:
+                self.session.human_is_white = found
+                print(
+                    f"side detect (yolo): you={'white' if found else 'black'} "
+                    f"(bot={'black' if found else 'white'})"
+                )
+                self._capture_empty_reference(frame)
+                self._prev_warped = self._snapshot_board_gray(frame)
+                return found
+
         setup = setup_from_corner_pieces(frame, search_roi=roi, existing_board=roi)
         if setup is None:
             setup = setup_from_corner_pieces(frame, search_roi=None, existing_board=roi)
         if setup is not None:
-            # Keep sticky cal lock for geometry; only take colour/side from corners.
             self._apply_board_corners(
                 setup.board_corners_px, force_square=False, update_projector=False, persist=False
             )
@@ -316,8 +331,6 @@ class ChessGameSession:
 
         found = detect_human_is_white(frame, cal.board_corners_camera)
         if found is None:
-            # Do NOT default to human=white — that is what assigned white to the
-            # player while the white army sat on the bot side (see Pi log).
             print("setup: side inconclusive — leaving quick-start colour; check piece colours")
             self._capture_empty_reference(frame)
             self._prev_warped = self._snapshot_board_gray(frame)
@@ -490,18 +503,16 @@ class ChessGameSession:
             self._lock_physical_board(frame_bgr, update_projector=True)
 
         roi = self._last_good_quad if self._last_good_quad is not None else cal.board_corners_camera
-        occ = self.occupancy.detect(frame_bgr, roi)
+        occ = self.occupancy.detect(frame_bgr, roi, prefer_yolo=True)
         ready = looks_like_starting_occupancy(occ.grid)
+        summary = occupancy_debug_summary(occ.grid, method=occ.method, colors=occ.colors)
         # Regular piece-count debug so we can see why setup is stuck.
         if self._setup_tick == 1 or self._setup_tick % 20 == 0 or (ready and self._setup_ready_frames == 0):
-            print(f"setup occupancy: {occupancy_debug_summary(occ.grid)}")
+            print(f"setup occupancy: {summary}")
         if ready:
             self._setup_ready_frames += 1
             if self._setup_ready_frames == 1 or self._setup_ready_frames % 6 == 0:
-                print(
-                    f"setup: start-like — holding {self._setup_ready_frames}/12 "
-                    f"({occupancy_debug_summary(occ.grid)})"
-                )
+                print(f"setup: start-like — holding {self._setup_ready_frames}/12 ({summary})")
         else:
             self._setup_ready_frames = 0
             return

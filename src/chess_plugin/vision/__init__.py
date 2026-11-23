@@ -14,6 +14,8 @@ class OccupancyResult:
     grid: np.ndarray  # 8x8 bool
     confidence: np.ndarray  # 8x8 float
     warped_bgr: np.ndarray | None = None
+    method: str = "classical"
+    colors: np.ndarray | None = None  # 8x8 int8: -1 empty, 0 white, 1 black (YOLO)
 
 
 @dataclass
@@ -419,8 +421,21 @@ class BoardOccupancyDetector:
         frame_bgr: np.ndarray,
         board_corners_px: np.ndarray,
         empty_reference: np.ndarray | None = None,
+        *,
+        prefer_yolo: bool = True,
     ) -> OccupancyResult:
-        """board_corners_px: 4x2 TL, TR, BR, BL in camera pixels — analysis is board-only."""
+        """board_corners_px: 4x2 TL, TR, BR, BL in camera pixels — analysis is board-only.
+
+        Prefers piece YOLO (``pieces.onnx``) when present; classical texture is fallback.
+        """
+        if prefer_yolo:
+            yolo = occupancy_from_yolo_pieces(frame_bgr, board_corners_px)
+            if yolo is not None and int(yolo.grid.sum()) >= 8:
+                return yolo
+            if yolo is not None:
+                print(
+                    f"occupancy yolo weak ({int(yolo.grid.sum())} pcs) — trying classical"
+                )
         warped = warp_board(frame_bgr, board_corners_px, out_size=400)
         if empty_reference is None and self.empty_reference is None:
             if self.ensure_empty_reference(warped):
@@ -466,7 +481,9 @@ class BoardOccupancyDetector:
                     occupied = edge_density > 6.0 or texture > 12.0 or lap > 60.0
                     conf[r, c] = min(1.0, max(edge_density / 18.0, texture / 28.0, lap / 120.0))
                 grid[r, c] = occupied
-        return OccupancyResult(grid=grid, confidence=conf, warped_bgr=warped)
+        return OccupancyResult(
+            grid=grid, confidence=conf, warped_bgr=warped, method="classical"
+        )
 
 
 def occupancy_mismatch(a: np.ndarray, b: np.ndarray) -> int:
@@ -546,6 +563,87 @@ def warp_board(frame_bgr: np.ndarray, corners_px: np.ndarray, out_size: int = 40
     return cv2.warpPerspective(frame_bgr, H, (out_size, out_size))
 
 
+def camera_xy_to_board_rc(
+    xy: tuple[float, float],
+    board_corners_px: np.ndarray,
+    *,
+    out_size: int = 400,
+) -> tuple[int, int] | None:
+    """Map a camera pixel to board (row, col) with row0=rank8 … row7=rank1."""
+    src = np.asarray(board_corners_px, dtype=np.float32).reshape(4, 2)
+    dst = np.array(
+        [[0, 0], [out_size - 1, 0], [out_size - 1, out_size - 1], [0, out_size - 1]],
+        dtype=np.float32,
+    )
+    H = cv2.getPerspectiveTransform(src, dst)
+    pt = cv2.perspectiveTransform(np.array([[[xy[0], xy[1]]]], dtype=np.float32), H)[0, 0]
+    x, y = float(pt[0]), float(pt[1])
+    if x < -2 or y < -2 or x > out_size + 1 or y > out_size + 1:
+        return None
+    sq = out_size / 8.0
+    c = int(np.clip(x / sq, 0, 7))
+    r = int(np.clip(y / sq, 0, 7))
+    return r, c
+
+
+def occupancy_from_yolo_pieces(
+    frame_bgr: np.ndarray,
+    board_corners_px: np.ndarray,
+    *,
+    conf: float = 0.25,
+) -> OccupancyResult | None:
+    """Piece YOLO → 8×8 occupancy (+ white/black colours). None if weights missing."""
+    try:
+        from gamebot.piece_detect import CLASS_BLACK, CLASS_WHITE, detect_pieces, pieces_available
+    except Exception:
+        return None
+    if not pieces_available():
+        return None
+    dets = detect_pieces(frame_bgr, conf=conf, search_roi=board_corners_px)
+    grid = np.zeros((8, 8), dtype=bool)
+    conf_g = np.zeros((8, 8), dtype=np.float64)
+    colors = np.full((8, 8), -1, dtype=np.int8)
+    for d in dets:
+        rc = camera_xy_to_board_rc(d.xy, board_corners_px)
+        if rc is None:
+            continue
+        r, c = rc
+        # Keep highest-confidence piece if two map to same square.
+        if grid[r, c] and conf_g[r, c] >= d.conf:
+            continue
+        grid[r, c] = True
+        conf_g[r, c] = d.conf
+        colors[r, c] = CLASS_WHITE if d.cls == CLASS_WHITE else CLASS_BLACK
+    warped = warp_board(frame_bgr, board_corners_px, out_size=400)
+    n_w = int(np.count_nonzero(colors == CLASS_WHITE))
+    n_b = int(np.count_nonzero(colors == CLASS_BLACK))
+    print(f"occupancy yolo: {int(grid.sum())} pieces (white={n_w} black={n_b})")
+    return OccupancyResult(
+        grid=grid, confidence=conf_g, warped_bgr=warped, method="yolo", colors=colors
+    )
+
+
+def detect_human_is_white_from_colors(colors: np.ndarray) -> bool | None:
+    """Bottom ranks = bot, top = human. More white pieces on a side ⇒ that side is white."""
+    c = np.asarray(colors)
+    if c.shape != (8, 8):
+        return None
+    human = c[0:2]  # top of warp / camera
+    bot = c[6:8]
+    hw = int(np.count_nonzero(human == 0))
+    hb = int(np.count_nonzero(human == 1))
+    bw = int(np.count_nonzero(bot == 0))
+    bb = int(np.count_nonzero(bot == 1))
+    print(f"side detect (yolo): human w/b={hw}/{hb}  bot w/b={bw}/{bb}")
+    if hw + hb < 4 or bw + bb < 4:
+        return None
+    human_white_frac = hw / max(hw + hb, 1)
+    bot_white_frac = bw / max(bw + bb, 1)
+    if abs(human_white_frac - bot_white_frac) < 0.15:
+        return None
+    return human_white_frac > bot_white_frac
+
+
 def occupancy_from_board(board: chess.Board) -> np.ndarray:
     """Ground-truth occupancy from a python-chess board (row0 = rank8)."""
     g = np.zeros((8, 8), dtype=bool)
@@ -556,7 +654,12 @@ def occupancy_from_board(board: chess.Board) -> np.ndarray:
     return g
 
 
-def occupancy_debug_summary(grid: np.ndarray) -> str:
+def occupancy_debug_summary(
+    grid: np.ndarray,
+    *,
+    method: str | None = None,
+    colors: np.ndarray | None = None,
+) -> str:
     """One-line debug: piece counts vs starting position (row0=rank8 … row7=rank1)."""
     g = np.asarray(grid, dtype=bool)
     expected = occupancy_from_board(chess.Board())
@@ -567,8 +670,16 @@ def occupancy_debug_summary(grid: np.ndarray) -> str:
     rank_bits = " ".join(f"r{8 - r}:{per_rank[r]}" for r in range(8))
     back = per_rank[0] + per_rank[1] + per_rank[6] + per_rank[7]
     mid = sum(per_rank[2:6])
+    prefix = f"[{method}] " if method else ""
+    colour_bit = ""
+    if colors is not None:
+        colour_bit = (
+            f" w={int(np.count_nonzero(colors == 0))}"
+            f" b={int(np.count_nonzero(colors == 1))}"
+        )
     return (
-        f"pieces≈{n}/32 mismatch≈{miss} back≈{back}/32 mid≈{mid}/0 | {rank_bits}"
+        f"{prefix}pieces≈{n}/32{colour_bit} mismatch≈{miss} "
+        f"back≈{back}/32 mid≈{mid}/0 | {rank_bits}"
     )
 
 
