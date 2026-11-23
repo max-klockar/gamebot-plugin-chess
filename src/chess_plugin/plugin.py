@@ -44,42 +44,83 @@ from gamebot.plugins.protocol import IdentifyContext, RuntimeHandles
 from gamebot.ui import Scene
 
 
-# How long the move arrow stays up before a dark gap. The gap throws away one
-# frame that can still contain the previous light, then scores the next one.
-ARROW_ON_S = 0.7
+# Arrow stays up until a hand crosses the board, or this long with no hand.
+ARROW_WATCH_S = 10.0
+# Frames to drop after the light goes out. The sensor is still showing the arrow
+# for the first of these; scoring earlier puts a box on the empty square.
+ARROW_DARK_SKIP = 3
+# After the arrow lights, ignore motion for this many frames so the light
+# itself is not read as a hand.
+ARROW_ARM = 3
+# Dark check that never becomes a still position. A hand in frame resets it.
+ARROW_CHECK_S = 3.0
+
+ARROW_SHOW = "show"
+ARROW_FLUSH = "flush"
+ARROW_CHECK = "check"
 
 
 @dataclass
-class ArrowPulse:
-    """What the projector was showing while the current frame was exposed."""
+class ArrowWatch:
+    """Arrow guidance. ``phase`` on entry was showing during this exposure."""
 
-    lit: bool = False
-    on_since: float = 0.0
+    phase: str = ARROW_SHOW
+    since: float = 0.0
     dark_skip: int = 0
+    arm: int = 0
+
+    @property
+    def lit(self) -> bool:
+        return self.phase == ARROW_SHOW
 
 
-def step_arrow_pulse(pulse: ArrowPulse, *, active: bool, now: float, on_s: float = ARROW_ON_S) -> bool:
-    """Advance one captured frame. True when this frame was taken with the arrow off.
+def step_arrow_watch(
+    watch: ArrowWatch,
+    *,
+    active: bool,
+    motion: bool,
+    now: float,
+    watch_s: float = ARROW_WATCH_S,
+    dark_skip: int = ARROW_DARK_SKIP,
+    arm: int = ARROW_ARM,
+    check_s: float = ARROW_CHECK_S,
+) -> str:
+    """One captured frame. ``score`` only while the arrow is dark and the hand is still.
 
-    ``pulse.lit`` on entry is the projection during the exposure. On return it
-    is what to project next. The first dark frame is discarded.
+    ``watch.phase`` on return is what to project next. Show waits for a hand or
+    ``watch_s``. Flush drops the frames that can still contain the arrow. Check
+    scores still frames, and lights the arrow again if the check never settles.
     """
     if not active:
-        pulse.lit = False
-        pulse.dark_skip = 0
-        return True
-    if pulse.lit:
-        if now - pulse.on_since >= on_s:
-            pulse.lit = False
-            pulse.dark_skip = 1
-        return False
-    if pulse.dark_skip > 0:
-        pulse.dark_skip -= 1
-        pulse.lit = False
-        return False
-    pulse.lit = True
-    pulse.on_since = now
-    return True
+        watch.phase = ARROW_SHOW
+        watch.dark_skip = 0
+        watch.arm = 0
+        return "score"
+    if watch.phase == ARROW_SHOW:
+        if watch.arm > 0:
+            watch.arm -= 1
+            return "skip"
+        if motion or (now - watch.since) >= watch_s:
+            watch.phase = ARROW_FLUSH
+            watch.dark_skip = dark_skip
+            watch.since = now
+        return "skip"
+    if watch.phase == ARROW_FLUSH:
+        watch.dark_skip -= 1
+        if watch.dark_skip <= 0:
+            watch.phase = ARROW_CHECK
+            watch.since = now
+        return "skip"
+    if motion:
+        watch.since = now
+        return "skip"
+    if (now - watch.since) >= check_s:
+        watch.phase = ARROW_SHOW
+        watch.since = now
+        watch.dark_skip = 0
+        watch.arm = arm
+        return "skip"
+    return "score"
 
 
 def looks_like_chessboard(frame_bgr: np.ndarray, corners: np.ndarray | None = None) -> bool:
@@ -161,7 +202,7 @@ class ChessGameSession:
         self._lock_pending_quad: np.ndarray | None = None
         self._lock_pending_count = 0
         self._lock_frozen = False
-        self._arrow = ArrowPulse()
+        self._arrow = ArrowWatch()
         self._capture_moves = bool(getattr(cfg, "capture_moves", False))
         self._pending_still: tuple[str, str] | None = None
         self._vision_public: dict = {"fen": "", "phase": "", "colors": None, "pieces": []}
@@ -299,6 +340,12 @@ class ChessGameSession:
             "colors": colors,
             "pieces": list(occ.pieces or []),
         }
+
+    def _hide_stale_boxes(self) -> None:
+        """Live frames that were not detected must not keep the last rectangles."""
+        if not self._vision_public.get("pieces"):
+            return
+        self._vision_public = {**self._vision_public, "pieces": []}
 
     def _read_occupancy(self, frame_bgr: np.ndarray):
         roi = self._board_roi()
@@ -645,7 +692,7 @@ class ChessGameSession:
         promo_label = None
         if s.last_engine_promotion:
             promo_label = chess.piece_symbol(s.last_engine_promotion).upper()
-        # The arrow pulses. Frames exposed while it is lit are not scored.
+        # Lit while the player has not reached in yet. Dark frames are the ones scored.
         engine_arrow = None
         if self._awaiting_settle and self._arrow.lit and s.last_engine_move is not None:
             engine_arrow = s.last_engine_move
@@ -698,6 +745,7 @@ class ChessGameSession:
             if s.confirm_promotion(int(zone_id.split(":", 1)[1])) and s.board.move_stack:
                 self._pending_still = ("human", s.board.move_stack[-1].uci())
             self._awaiting_settle = True
+            self._arm_arrow()
             self._reset_pending()
             return
         if zone_id == "again":
@@ -821,9 +869,7 @@ class ChessGameSession:
                 if isinstance(cam, MockCamera):
                     cam.set_occupancy(occupancy_from_board(s.board))
                 self._awaiting_settle = True
-                self._arrow.lit = True
-                self._arrow.on_since = time.monotonic()
-                self._arrow.dark_skip = 0
+                self._arm_arrow()
                 self._reset_pending()
                 self._log_state("engine_played", uci=result.move.uci())
         except Exception as exc:  # noqa: BLE001 — keep session alive
@@ -849,6 +895,18 @@ class ChessGameSession:
             cam.set_occupancy(occupancy_from_board(s.board))
         self._awaiting_settle = True
         self._reset_pending()
+
+    def _arm_arrow(self) -> None:
+        self._arrow.phase = ARROW_SHOW
+        self._arrow.since = time.monotonic()
+        self._arrow.dark_skip = 0
+        self._arrow.arm = ARROW_ARM
+        self._last_gray = None
+
+    def _show_arrow_again(self) -> None:
+        self._arm_arrow()
+        self._reset_pending()
+        print("arrow on — piece has not moved")
 
     def _hand_to_player_after_bot(self, frame_bgr: np.ndarray) -> None:
         s = self.session
@@ -978,17 +1036,34 @@ class ChessGameSession:
         if self._calibration is None or s.phase != Phase.PLAY:
             return
         self._dbg_tick += 1
-        if self._awaiting_settle:
+        if self._awaiting_settle and not isinstance(self._camera, MockCamera):
             if not s.is_human_turn():
                 return
-            # Lit frames contain the arrowhead, which YOLO reads as a piece.
-            was_lit = self._arrow.lit
-            if not step_arrow_pulse(self._arrow, active=True, now=time.monotonic()):
-                if was_lit and not self._arrow.lit:
-                    print("arrow off — skipping one frame, then scoring")
+            # The arrow is a piece to YOLO. Look only after it has been dark,
+            # and only once a hand (or the 10s peek) says something may have changed.
+            prev = self._arrow.phase
+            motion = False
+            if prev in (ARROW_SHOW, ARROW_CHECK):
+                motion = self._hand_is_moving(frame_bgr)
+            action = step_arrow_watch(
+                self._arrow, active=True, motion=motion, now=time.monotonic()
+            )
+            if prev == ARROW_SHOW and self._arrow.phase == ARROW_FLUSH:
+                why = "hand" if motion else "10s"
+                print(f"arrow off — {why}, checking the board")
+            if prev == ARROW_FLUSH and self._arrow.phase == ARROW_CHECK:
+                self._last_gray = None
+            if prev == ARROW_CHECK and self._arrow.phase == ARROW_SHOW:
+                self._last_gray = None
+                self._reset_pending()
+                print("arrow on — board didn't settle")
+            if action != "score":
+                if self._arrow.phase == ARROW_CHECK and motion:
+                    self._reset_pending()
+                self._hide_stale_boxes()
                 return
         else:
-            step_arrow_pulse(self._arrow, active=False, now=time.monotonic())
+            step_arrow_watch(self._arrow, active=False, motion=False, now=time.monotonic())
 
         observed = self._observe_board(frame_bgr, s.board)
         if observed is None:
@@ -1001,7 +1076,14 @@ class ChessGameSession:
             if occupancy_frame_is_noise(occ.grid, s.board, verdict):
                 return
             if self._physical_board_is_pre_engine(occ.grid):
-                self._reset_pending()
+                if self._pending_uci != "__home__":
+                    self._pending_uci = "__home__"
+                    self._pending_count = 1
+                    print("occ: piece still on the start square — confirming…")
+                else:
+                    self._pending_count += 1
+                if self._pending_count >= self._confirm_need:
+                    self._show_arrow_again()
                 return
             if self._dbg_tick % 30 == 0:
                 print(
