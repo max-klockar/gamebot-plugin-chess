@@ -329,20 +329,6 @@ def setup_from_corner_pieces(
     )
 
 
-def square_diff_energy(prev_gray: np.ndarray, curr_gray: np.ndarray, inset_frac: float = 0.22) -> np.ndarray:
-    """Per-square mean abs-diff inside the warped board (8x8)."""
-    diff = cv2.absdiff(prev_gray, curr_gray).astype(np.float32)
-    h = diff.shape[0]
-    sq = h // 8
-    inset = max(6, int(sq * inset_frac))
-    energy = np.zeros((8, 8), dtype=np.float64)
-    for r in range(8):
-        for c in range(8):
-            patch = diff[r * sq + inset : (r + 1) * sq - inset, c * sq + inset : (c + 1) * sq - inset]
-            energy[r, c] = float(patch.mean()) if patch.size else 0.0
-    return energy
-
-
 def square_rc(sq: chess.Square) -> tuple[int, int]:
     """Board image row/col for a chess square (rank 8 = row 0)."""
     return 7 - chess.square_rank(sq), chess.square_file(sq)
@@ -363,41 +349,6 @@ def squares_affected_by_move(board_before: chess.Board, move: chess.Move) -> lis
         cap = chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))
         sqs.append(cap)
     return sqs
-
-
-def mask_energy_squares(energy: np.ndarray, squares: list[chess.Square], factor: float = 0.0) -> np.ndarray:
-    """Copy of energy with listed squares attenuated (0 = fully explained away)."""
-    out = energy.copy()
-    for sq in squares:
-        r, c = square_rc(sq)
-        out[r, c] *= factor
-    return out
-
-
-def energy_on_squares(energy: np.ndarray, squares: list[chess.Square]) -> float:
-    return float(sum(energy[square_rc(sq)] for sq in squares))
-
-
-def hypothesize_moves_from_diff(
-    energy: np.ndarray,
-    board: chess.Board,
-    *,
-    min_square: float = 10.0,
-) -> list[MoveHypothesis]:
-    """Score legal moves by how much their from/to squares changed in the board ROI."""
-    scored: list[MoveHypothesis] = []
-    for m in board.legal_moves:
-        fr, fc = square_rc(m.from_square)
-        tr, tc = square_rc(m.to_square)
-        e_from = float(energy[fr, fc])
-        e_to = float(energy[tr, tc])
-        if e_from < min_square and e_to < min_square:
-            continue
-        # Both ends should change for a normal move; captures still light up both.
-        score = e_from + e_to
-        scored.append(MoveHypothesis(m, score))
-    scored.sort(key=lambda h: h.score, reverse=True)
-    return scored
 
 
 class BoardOccupancyDetector:
@@ -631,6 +582,21 @@ def camera_xy_to_board_rc(
     return r, c
 
 
+_yolo_log_key: tuple[int, int, int, int, str] | None = None
+_yolo_log_i = 0
+
+
+def _log_yolo_occupancy(n: int, n_w: int, n_b: int, raw_boxes: int, extra: str) -> None:
+    """Print when the piece count changes, plus a slow heartbeat."""
+    global _yolo_log_key, _yolo_log_i
+    _yolo_log_i += 1
+    key = (n, n_w, n_b, raw_boxes, extra)
+    if key == _yolo_log_key and _yolo_log_i % 20 != 0:
+        return
+    _yolo_log_key = key
+    print(f"occupancy yolo: {n} on-board (white={n_w} black={n_b}, raw_boxes={raw_boxes}{extra})")
+
+
 def occupancy_from_yolo_pieces(
     frame_bgr: np.ndarray,
     board_corners_px: np.ndarray,
@@ -665,10 +631,7 @@ def occupancy_from_yolo_pieces(
     n_w = int(np.count_nonzero(colors == CLASS_WHITE))
     n_b = int(np.count_nonzero(colors == CLASS_BLACK))
     extra = f", {off_board} off-board" if off_board else ""
-    print(
-        f"occupancy yolo: {int(grid.sum())} on-board "
-        f"(white={n_w} black={n_b}, raw_boxes={len(dets)}{extra})"
-    )
+    _log_yolo_occupancy(int(grid.sum()), n_w, n_b, len(dets), extra)
     return OccupancyResult(
         grid=grid, confidence=conf_g, warped_bgr=warped, method="yolo", colors=colors
     )
@@ -767,16 +730,57 @@ def changed_squares(before: np.ndarray, after: np.ndarray) -> list[chess.Square]
     return out
 
 
+def colors_support_move(
+    colors: np.ndarray | None,
+    move: chess.Move,
+    board: chess.Board,
+) -> bool:
+    """YOLO colours on the squares this move touches match the resulting position.
+
+    Classical occupancy has no colours and is accepted. A destination that still
+    shows the other side is a missed box, not a capture.
+    """
+    if colors is None:
+        return True
+    if move not in board.legal_moves:
+        # Promotion choice is collapsed to a bare from-to before the piece is picked.
+        promo = [
+            m
+            for m in board.legal_moves
+            if m.from_square == move.from_square
+            and m.to_square == move.to_square
+            and m.promotion
+        ]
+        if not promo:
+            return False
+        move = promo[0]
+    after = board.copy()
+    after.push(move)
+    for sq in squares_affected_by_move(board, move):
+        r, c = square_rc(sq)
+        seen = int(colors[r, c])
+        piece = after.piece_at(sq)
+        if piece is None:
+            if seen != -1:
+                return False
+        else:
+            want = 0 if piece.color == chess.WHITE else 1
+            if seen != want:
+                return False
+    return True
+
+
 def classify_occupancy_vs_board(
     seen: np.ndarray,
     board: chess.Board,
     *,
     match_slop: int = 0,
+    colors: np.ndarray | None = None,
 ) -> OccupancyVerdict:
     """Compare YOLO/classical occupancy to the software board.
 
     - match: seen ≈ expected (unchanged)
-    - one_legal: delta is exactly one legal move
+    - one_legal: delta is exactly one legal move, and colours agree when present
     - illegal_or_multi: anything else (wrong change or too many changes)
     """
     expected = occupancy_from_board(board)
@@ -786,7 +790,11 @@ def classify_occupancy_vs_board(
     if miss <= match_slop:
         return OccupancyVerdict(OccupancyKind.MATCH, miss, None, changed)
 
-    hyps = hypothesize_moves(expected, seen_b, board)
+    hyps = [
+        h
+        for h in hypothesize_moves(expected, seen_b, board)
+        if colors_support_move(colors, h.move, board)
+    ]
     # Prefer a single unambiguous legal interpretation.
     if len(hyps) == 1:
         return OccupancyVerdict(OccupancyKind.ONE_LEGAL, miss, hyps[0].move, changed)
@@ -802,6 +810,25 @@ def classify_occupancy_vs_board(
                 changed,
             )
     return OccupancyVerdict(OccupancyKind.ILLEGAL_OR_MULTI, miss, None, changed)
+
+
+def occupancy_frame_is_noise(
+    seen: np.ndarray,
+    board: chess.Board,
+    verdict: OccupancyVerdict,
+) -> bool:
+    """Extra boxes or a one-square flicker. Not a move and not a fault.
+
+    A legal move never adds a piece. One stray detection (33 on a full board)
+    used to enter FAULT and then clear on the next sloppy match.
+    """
+    if verdict.kind in (OccupancyKind.MATCH, OccupancyKind.ONE_LEGAL):
+        return False
+    seen_n = int(np.asarray(seen, dtype=bool).sum())
+    expected_n = int(occupancy_from_board(board).sum())
+    if seen_n > expected_n:
+        return True
+    return verdict.mismatch <= 1
 
 
 def hypothesize_moves(
@@ -873,46 +900,3 @@ def hypothesize_moves(
             seen.add(u)
             unique.append(h)
     return unique
-
-
-@dataclass
-class TokenDetection:
-    xy_px: tuple[int, int]
-    radius: float
-    score: float
-
-
-class TokenTapDetector:
-    """Find a distinct colored token (default red) for projected button presses."""
-
-    def __init__(
-        self,
-        hsv_low: tuple[int, int, int] = (0, 120, 80),
-        hsv_high: tuple[int, int, int] = (10, 255, 255),
-        hsv_low2: tuple[int, int, int] = (170, 120, 80),
-        hsv_high2: tuple[int, int, int] = (180, 255, 255),
-        min_area: int = 80,
-    ) -> None:
-        self.hsv_low = np.array(hsv_low, dtype=np.uint8)
-        self.hsv_high = np.array(hsv_high, dtype=np.uint8)
-        self.hsv_low2 = np.array(hsv_low2, dtype=np.uint8)
-        self.hsv_high2 = np.array(hsv_high2, dtype=np.uint8)
-        self.min_area = min_area
-
-    def detect(self, frame_bgr: np.ndarray) -> TokenDetection | None:
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        mask1 = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
-        mask2 = cv2.inRange(hsv, self.hsv_low2, self.hsv_high2)
-        mask = cv2.bitwise_or(mask1, mask2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best: TokenDetection | None = None
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area:
-                continue
-            (x, y), radius = cv2.minEnclosingCircle(cnt)
-            score = float(area)
-            if best is None or score > best.score:
-                best = TokenDetection((int(x), int(y)), float(radius), score)
-        return best

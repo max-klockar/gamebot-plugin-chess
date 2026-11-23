@@ -29,7 +29,9 @@ from chess_plugin.vision import (
     detect_human_is_white_from_colors,
     looks_like_starting_occupancy,
     occupancy_debug_summary,
+    occupancy_frame_is_noise,
     occupancy_from_board,
+    occupancy_mismatch,
     setup_from_corner_pieces,
     warp_board,
 )
@@ -43,8 +45,6 @@ from gamebot.ui import Scene
 def looks_like_chessboard(frame_bgr: np.ndarray, corners: np.ndarray | None = None) -> bool:
     """Heuristic identify: 8x8 alternating pattern in the board ROI."""
     if corners is not None and len(corners) == 4:
-        from chess_plugin.vision import warp_board
-
         warped = warp_board(frame_bgr, corners, out_size=240)
     else:
         h, w = frame_bgr.shape[:2]
@@ -101,11 +101,12 @@ class ChessGameSession:
         self._pending_count = 0
         self._pending_fault_key: str | None = None
         self._pending_fault_count = 0
-        self._pending_fault_squares: list[chess.Square] = []
+        self._fault_clear_count = 0
         self._dbg_tick = 0
         self._exit = False
-        self._confirm_need = 5
-        self._fault_confirm_need = 8
+        self._confirm_need = 2
+        self._fault_confirm_need = 10
+        self._fault_clear_need = 4
         self._state_log_path = Path(runtime.data_dir) / "chess_state.log"
         self._state_json_path = Path(runtime.data_dir) / "chess_state.json"
         self._camera = getattr(runtime, "camera", None)
@@ -190,7 +191,7 @@ class ChessGameSession:
         self.session.clear_fault()
         self._pending_fault_key = None
         self._pending_fault_count = 0
-        self._pending_fault_squares = []
+        self._fault_clear_count = 0
         self._pending_uci = None
         self._pending_count = 0
         self._sync_turn_led()
@@ -202,7 +203,7 @@ class ChessGameSession:
         self._pending_count = 0
         self._pending_fault_key = None
         self._pending_fault_count = 0
-        self._pending_fault_squares = []
+        self._fault_clear_count = 0
 
     def _board_roi(self) -> np.ndarray | None:
         cal = self._calibration
@@ -224,10 +225,14 @@ class ChessGameSession:
             self._set_led(LedMode.ERROR)
         elif s.phase != Phase.PLAY:
             self._set_led(LedMode.IDLE)
-        elif self._awaiting_settle or not s.is_human_turn():
+        elif self._pending_uci and not self._pending_uci.startswith("__"):
+            # First sight of a human move — bot colour immediately, before confirm.
             self._set_led(LedMode.BOT_TURN)
-        else:
+        elif self._awaiting_settle or s.is_human_turn():
+            # Arrow is up, or it is the human's turn to move.
             self._set_led(LedMode.PLAYER_TURN)
+        else:
+            self._set_led(LedMode.BOT_TURN)
 
     def _seed_lock_from_calibration(self) -> None:
         """Paint magenta border from cal once — board does not move; stop chasing vision."""
@@ -267,6 +272,7 @@ class ChessGameSession:
             return
         cal.board_corners_camera = board_cam
         cal.H_table_to_camera = H_t2c
+        self._last_good_quad = np.array(board_cam, copy=True)
         if update_projector:
             board_proj = warp_points(board_cam, cal.H_camera_to_projector)
             H_t2p = estimate_homography(table, board_proj)
@@ -301,19 +307,31 @@ class ChessGameSession:
                     print(f"could not save updated board corners: {exc}")
 
     def _capture_empty_reference(self, frame_bgr: np.ndarray) -> None:
-        cal = self._calibration
-        if cal is None:
+        roi = self._board_roi()
+        if roi is None:
             return
-        warped = warp_board(frame_bgr, cal.board_corners_camera, out_size=400)
+        warped = warp_board(frame_bgr, roi, out_size=400)
         self.occupancy.set_empty_reference_from_warped(warped)
         print("occupancy: empty-square reference captured (board ROI only)")
 
     def _snapshot_board_gray(self, frame_bgr: np.ndarray) -> np.ndarray | None:
-        cal = self._calibration
-        if cal is None:
+        roi = self._board_roi()
+        if roi is None:
             return None
-        warped = warp_board(frame_bgr, cal.board_corners_camera, out_size=400)
+        warped = warp_board(frame_bgr, roi, out_size=400)
         return cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+
+    def _hand_is_moving(self, frame_bgr: np.ndarray) -> bool:
+        """Pause classification while a hand is in frame. Keep the pending count."""
+        gray = self._snapshot_board_gray(frame_bgr)
+        if gray is None:
+            return False
+        if self._last_gray is None:
+            self._last_gray = gray
+            return False
+        motion = float(np.mean(cv2.absdiff(self._last_gray, gray)))
+        self._last_gray = gray
+        return motion > 5.0
 
     def _lock_physical_board(
         self,
@@ -397,20 +415,18 @@ class ChessGameSession:
         self._lock_frozen = True
         return new_quad
 
-    def _resolve_setup_from_camera(self) -> bool:
+    def _resolve_setup_from_camera(self, frame: np.ndarray) -> bool:
         """Lock physical board (YOLO+mech), then corner-piece colour / optional pose."""
         cal = self._calibration
-        cam = self._camera
-        if cal is None or cam is None:
-            print("setup: no camera/cal — assuming human=white")
+        if cal is None:
+            print("setup: no calibration — assuming human=white")
             self.session.human_is_white = True
             return True
-        frame = cam.read()
-        for _ in range(3):
-            frame = cam.read()
 
         locked = self._lock_physical_board(frame)
-        roi = locked if locked is not None else cal.board_corners_camera
+        roi = locked if locked is not None else self._board_roi()
+        if roi is None:
+            roi = cal.board_corners_camera
 
         # Prefer YOLO white/black counts on each side of the board.
         occ = self.occupancy.detect(frame, roi, prefer_yolo=True)
@@ -446,7 +462,7 @@ class ChessGameSession:
             self._capture_empty_reference(frame)
             return setup.human_is_white
 
-        found = detect_human_is_white(frame, cal.board_corners_camera)
+        found = detect_human_is_white(frame, roi)
         if found is None:
             print("setup: side inconclusive — leaving quick-start colour; check piece colours")
             self._capture_empty_reference(frame)
@@ -616,12 +632,14 @@ class ChessGameSession:
         if s.phase == Phase.FAULT:
             self._set_led(LedMode.ERROR)
             self._poll_fault_recover(frame_bgr)
+            self._sync_turn_led()
             return
         if s.phase != Phase.PLAY:
             return
         self._sync_turn_led()
         if self._awaiting_settle or s.is_human_turn():
             self._poll_board_move(frame_bgr)
+            self._sync_turn_led()
         if (
             s.phase == Phase.PLAY
             and not s.is_human_turn()
@@ -663,7 +681,7 @@ class ChessGameSession:
         if self._setup_ready_frames < 8:
             return
 
-        human_white = self._resolve_setup_from_camera()
+        human_white = self._resolve_setup_from_camera(frame_bgr)
         side = "white" if human_white else "black"
         print(f"setup ready — you={side}; starting game")
         self.session.confirm_setup(human_is_white=human_white)
@@ -687,33 +705,36 @@ class ChessGameSession:
         thinking = getattr(self.runtime, "thinking", None)
         if callable(thinking):
             thinking(True)
+        applied = False
         try:
             print(
                 f"engine move… stockfish={'yes' if self.engine.available else 'fallback'} "
                 f"skill={s.skill_level}"
             )
             result = self.engine.play(s.board, s.skill_level)
-            if not s.apply_engine_move(result.move):
+            applied = s.apply_engine_move(result.move)
+            if not applied:
                 print(f"engine move rejected: {result.move.uci()}")
                 self._log_state("engine_rejected", uci=result.move.uci())
-                return
-            print(
-                f"engine played {result.move.uci()} — place along the arrow "
-                "(you can also play your reply in the same motion)"
-            )
-            cam = self._camera
-            if isinstance(cam, MockCamera):
-                cam.set_occupancy(occupancy_from_board(s.board))
-            self._awaiting_settle = True
-            self._reset_pending()
-            self._set_led(LedMode.BOT_TURN)
-            self._log_state("engine_played", uci=result.move.uci())
+            else:
+                print(
+                    f"engine played {result.move.uci()} — place along the arrow "
+                    "(you can also play your reply in the same motion)"
+                )
+                cam = self._camera
+                if isinstance(cam, MockCamera):
+                    cam.set_occupancy(occupancy_from_board(s.board))
+                self._awaiting_settle = True
+                self._reset_pending()
+                self._log_state("engine_played", uci=result.move.uci())
         except Exception as exc:  # noqa: BLE001 — keep session alive
             print(f"engine turn failed: {exc}")
             self._log_state("engine_error", error=str(exc))
         finally:
             if callable(thinking):
                 thinking(False)
+            # Arrow is the human's cue — turquoise as soon as it is on the table.
+            self._set_led(LedMode.PLAYER_TURN if applied else LedMode.BOT_TURN)
 
     def _simulate_human_move(self) -> None:
         s = self.session
@@ -770,13 +791,13 @@ class ChessGameSession:
             self._pending_count = 1
             print(f"occ: candidate {uci} ({label})")
             self._log_state("occ_candidate", uci=uci, label=label, mismatch=None)
+            self._set_led(LedMode.BOT_TURN)
         return self._pending_count >= self._confirm_need
 
     def _confirm_fault(self, squares: list[chess.Square], reason: str) -> bool:
         key = reason + ":" + ",".join(chess.square_name(sq) for sq in squares[:6])
         self._pending_uci = None
         self._pending_count = 0
-        self._pending_fault_squares = list(squares)
         if key == self._pending_fault_key:
             self._pending_fault_count += 1
         else:
@@ -790,36 +811,51 @@ class ChessGameSession:
             )
         return self._pending_fault_count >= self._fault_confirm_need
 
+    def _observe_board(self, frame_bgr: np.ndarray, board: chess.Board):
+        """One still frame → occupancy + verdict. None while a hand is moving."""
+        if self._hand_is_moving(frame_bgr):
+            return None
+        occ = self._read_occupancy(frame_bgr)
+        if occ is None:
+            return None
+        verdict = classify_occupancy_vs_board(
+            occ.grid, board, match_slop=0, colors=occ.colors
+        )
+        return occ, verdict
+
+    def _physical_board_is_pre_engine(self, grid: np.ndarray) -> bool:
+        """Pieces still show the position from before the arrow was projected."""
+        s = self.session
+        if s.last_engine_move is None or not s.board.move_stack:
+            return False
+        pre = s.board.copy()
+        pre.pop()
+        return occupancy_mismatch(grid, occupancy_from_board(pre)) <= 1
+
     def _poll_fault_recover(self, frame_bgr: np.ndarray) -> None:
-        """Keep watching during FAULT; auto-clear when occupancy matches expected."""
+        """Stay in FAULT until the real position is back for several frames."""
         s = self.session
         if s.phase != Phase.FAULT:
             return
         self._dbg_tick += 1
-        gray = self._snapshot_board_gray(frame_bgr)
-        if gray is not None:
-            if self._last_gray is not None:
-                motion = float(np.mean(cv2.absdiff(self._last_gray, gray)))
-                self._last_gray = gray
-                if motion > 5.0:
-                    return
-            else:
-                self._last_gray = gray
-
-        occ = self._read_occupancy(frame_bgr)
-        if occ is None:
+        observed = self._observe_board(frame_bgr, s.board)
+        if observed is None:
             return
-        # Temporarily treat as PLAY so classify uses current FEN as expected.
-        verdict = classify_occupancy_vs_board(occ.grid, s.board, match_slop=1)
+        occ, verdict = observed
+        if occupancy_frame_is_noise(occ.grid, s.board, verdict):
+            self._fault_clear_count = 0
+            return
         if verdict.kind == OccupancyKind.MATCH:
-            self._clear_fault_state()
+            self._fault_clear_count += 1
+            if self._fault_clear_count >= self._fault_clear_need:
+                self._clear_fault_state()
             return
+        self._fault_clear_count = 0
         if verdict.kind == OccupancyKind.ONE_LEGAL and verdict.move is not None:
             if self._confirm_legal(verdict.move, label="fault_recover"):
                 s.phase = Phase.PLAY
                 self._apply_confirmed_human(verdict.move, source="fault_recover")
             return
-        self._reset_pending()
         if self._dbg_tick % 40 == 0:
             print(
                 f"fault: still odd (mismatch={verdict.mismatch} method={occ.method}) "
@@ -833,33 +869,28 @@ class ChessGameSession:
             )
 
     def _poll_board_move(self, frame_bgr: np.ndarray) -> None:
-        """Occupancy vs expected FEN: match / one legal / illegal-or-multi."""
+        """Occupancy vs expected FEN: match / one legal / ignore detector noise."""
         s = self.session
         if self._calibration is None or s.phase != Phase.PLAY:
             return
         self._dbg_tick += 1
-
-        gray = self._snapshot_board_gray(frame_bgr)
-        if gray is not None:
-            if self._last_gray is not None:
-                motion = float(np.mean(cv2.absdiff(self._last_gray, gray)))
-                self._last_gray = gray
-                # Hand moving — don't classify yet.
-                if motion > 5.0:
-                    self._reset_pending()
-                    return
-            else:
-                self._last_gray = gray
-
-        occ = self._read_occupancy(frame_bgr)
-        if occ is None:
+        observed = self._observe_board(frame_bgr, s.board)
+        if observed is None:
             return
+        occ, verdict = observed
 
-        # After engine move: expected already includes the bot ply.
         if self._awaiting_settle:
             if not s.is_human_turn():
                 return
-            verdict = classify_occupancy_vs_board(occ.grid, s.board, match_slop=1)
+            # Bot just moved in software. Until the pieces leave the previous
+            # position, a noisy grid must not become "the human replied".
+            if self._physical_board_is_pre_engine(occ.grid):
+                self._reset_pending()
+                return
+            if occupancy_frame_is_noise(occ.grid, s.board, verdict):
+                self._pending_fault_key = None
+                self._pending_fault_count = 0
+                return
             if self._dbg_tick % 30 == 0:
                 print(
                     f"settle occ: {verdict.kind.value} mismatch={verdict.mismatch} "
@@ -881,7 +912,6 @@ class ChessGameSession:
                 if self._confirm_legal(verdict.move, label="settle_combo"):
                     self._apply_confirmed_human(verdict.move, source="settle_combo")
                 return
-            # Partial / illegal during place — wait; soft-fault only after sustained mess.
             if verdict.mismatch >= 3 and self._confirm_fault(
                 verdict.changed_squares, "unexpected_while_placing"
             ):
@@ -898,7 +928,11 @@ class ChessGameSession:
         if not s.is_human_turn():
             return
 
-        verdict = classify_occupancy_vs_board(occ.grid, s.board, match_slop=0)
+        if occupancy_frame_is_noise(occ.grid, s.board, verdict):
+            self._pending_fault_key = None
+            self._pending_fault_count = 0
+            return
+
         if verdict.kind == OccupancyKind.MATCH:
             self._reset_pending()
             return
@@ -918,7 +952,6 @@ class ChessGameSession:
                 )
             return
 
-        # Illegal or too many changes.
         if self._confirm_fault(verdict.changed_squares, "unexpected"):
             self._enter_fault("unexpected board change", verdict.changed_squares)
         else:
