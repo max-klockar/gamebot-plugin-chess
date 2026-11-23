@@ -43,6 +43,19 @@ from gamebot.plugins.protocol import IdentifyContext, RuntimeHandles
 from gamebot.ui import Scene
 
 
+def arrow_release(origin_occupied: bool, dest_occupied: bool, saw_home: bool) -> tuple[bool, bool]:
+    """Whether to stop the engine arrow, and the updated home latch.
+
+    ``saw_home`` means we have seen the piece still on its origin with an empty
+    target, so a later occupied target is the piece arriving rather than the
+    arrowhead. An empty origin always means the piece has left.
+    """
+    if origin_occupied and not dest_occupied:
+        saw_home = True
+    drop = (not origin_occupied) or (dest_occupied and saw_home)
+    return drop, saw_home
+
+
 def looks_like_chessboard(frame_bgr: np.ndarray, corners: np.ndarray | None = None) -> bool:
     """Heuristic identify: 8x8 alternating pattern in the board ROI."""
     if corners is not None and len(corners) == 4:
@@ -123,6 +136,8 @@ class ChessGameSession:
         self._lock_pending_count = 0
         self._lock_frozen = False
         self._arrow_hidden = False
+        self._arrow_home_clear = False
+        self._arrow_blind = 0
         self._capture_moves = bool(getattr(cfg, "capture_moves", False))
         self._pending_still: tuple[str, str] | None = None
         self._vision_public: dict = {"fen": "", "phase": "", "colors": None, "pieces": []}
@@ -606,8 +621,8 @@ class ChessGameSession:
         promo_label = None
         if s.last_engine_promotion:
             promo_label = chess.piece_symbol(s.last_engine_promotion).upper()
-        # Hide bot arrow once the piece should already be placed (human's turn),
-        # or as soon as its origin square is empty.
+        # Hide the bot arrow once the piece has left home or landed on the target.
+        # The frame that decides that still contains the arrow, so scoring waits.
         engine_arrow = None if s.is_human_turn() else s.last_engine_move
         if self._awaiting_settle and not self._arrow_hidden:
             engine_arrow = s.last_engine_move
@@ -786,6 +801,8 @@ class ChessGameSession:
                     cam.set_occupancy(occupancy_from_board(s.board))
                 self._awaiting_settle = True
                 self._arrow_hidden = False
+                self._arrow_home_clear = False
+                self._arrow_blind = 0
                 self._reset_pending()
                 self._log_state("engine_played", uci=result.move.uci())
         except Exception as exc:  # noqa: BLE001 — keep session alive
@@ -860,16 +877,30 @@ class ChessGameSession:
             self._set_led(LedMode.BOT_TURN)
         return self._pending_count >= self._confirm_need
 
-    def _note_engine_piece_left(self, grid: np.ndarray) -> None:
-        """Drop the arrow once the bot piece is no longer on its origin square."""
+    def _release_arrow(self, grid: np.ndarray) -> bool:
+        """Hide the arrow once the piece leaves home or reaches the target.
+
+        The exposure that shows this still has the arrow in it, so the caller
+        skips scoring. ``_arrow_blind`` skips the next still frame too, which
+        can still contain the light. A target that is occupied before we have
+        seen the piece at home with an empty target is the arrowhead, not a move.
+        """
         move = self.session.last_engine_move
         if move is None or not self._awaiting_settle or self._arrow_hidden:
-            return
-        r, c = square_rc(move.from_square)
-        if bool(grid[r, c]):
-            return
+            return False
+        fr, fc = square_rc(move.from_square)
+        tr, tc = square_rc(move.to_square)
+        origin = bool(grid[fr, fc])
+        dest = bool(grid[tr, tc])
+        drop, self._arrow_home_clear = arrow_release(origin, dest, self._arrow_home_clear)
+        if not drop:
+            return False
         self._arrow_hidden = True
-        print(f"arrow off — {chess.square_name(move.from_square)} empty")
+        self._arrow_blind = 1
+        square = chess.square_name(move.to_square if dest else move.from_square)
+        why = "occupied" if dest else "empty"
+        print(f"arrow off — {square} {why}, rechecking without the arrow")
+        return True
 
     def _confirm_fault(self, squares: list[chess.Square], reason: str) -> bool:
         # Square list jitters when YOLO flickers. Latch on the reason, not the squares.
@@ -961,9 +992,17 @@ class ChessGameSession:
                 return
             # Bot just moved in software. Until the pieces leave the previous
             # position, a noisy grid must not become "the human replied".
+            if self._arrow_blind > 0:
+                self._arrow_blind -= 1
+                self._reset_pending()
+                return
+            # The arrow is a green line through the origin square. YOLO counts
+            # it as the piece that already left, so drop it before any verdict.
+            if self._release_arrow(occ.grid):
+                self._reset_pending()
+                return
             if occupancy_frame_is_noise(occ.grid, s.board, verdict):
                 return
-            self._note_engine_piece_left(occ.grid)
             if self._physical_board_is_pre_engine(occ.grid):
                 self._reset_pending()
                 return
