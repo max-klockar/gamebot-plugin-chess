@@ -339,7 +339,17 @@ class ChessGameSession:
             "phase": self.session.phase.name,
             "colors": colors,
             "pieces": list(occ.pieces or []),
+            "board": self._board_quad_points(),
         }
+
+    def _board_quad_points(self) -> list[list[float]] | None:
+        quad = self._board_roi()
+        if quad is None:
+            return None
+        arr = np.asarray(quad, dtype=float).reshape(-1, 2)
+        if len(arr) != 4:
+            return None
+        return arr.tolist()
 
     def _hide_stale_boxes(self) -> None:
         """Live frames that were not detected must not keep the last rectangles."""
